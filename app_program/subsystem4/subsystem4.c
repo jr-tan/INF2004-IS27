@@ -4,10 +4,10 @@
  */
 #include <stdbool.h>
 #include <stdint.h>
-
 #include "subsystem4.h"
+#include "subsystem4_mpu6050.h"
 
-/* Math library functions supplied by the linker (-lm). */
+/* Avoid pulling Newlib's size_t definitions into the μT-Kernel headers. */
 extern float atan2f(float y, float x);
 extern float sqrtf(float x);
 extern float sinf(float x);
@@ -25,27 +25,18 @@ static float g_integrated_height_cm = 0.0f;
 static float g_peak_hump_height_cm = 0.0f;
 static bool g_hump_active = false;
 
-static bool is_finite_sample(const imu_raw_sample_t *p_sample)
-{
-    return (p_sample != NULL);
-}
-
 ER subsystem4_init(void)
 {
     Subsystem4_Init();
     return E_OK;
 }
 
-/*
- * The application template calls subsystemN_start() after all subsystem init
- * functions have completed. No sensor-driver API was included with the
- * supplied Subsystem 4 files, so task creation/acquisition is intentionally
- * left to the integration layer rather than creating a task that cannot read
- * the physical IMU yet.
- */
+/* Start the hardware acquisition task after subsystem initialization. */
 ER subsystem4_start(void)
 {
-    return E_OK;
+    extern ID Subsystem4_Start_Sensor_Task(void);
+    ID task_id = Subsystem4_Start_Sensor_Task();
+    return (task_id > 0) ? E_OK : (ER)task_id;
 }
 
 void Subsystem4_Init(void)
@@ -74,11 +65,8 @@ bool Subsystem4_Calibrate(uint32_t timeout_ms)
         return false;
     }
 
-    /*
-     * Placeholder/nominal calibration for the current software tests.
-     * Replace this with averaging of real sensor samples before hardware use.
-     * MPU6050 accelerometer Z is treated as +1 g when level.
-     */
+    /* Nominal zero-bias calibration retained for deterministic unit tests.
+     * Normal hardware startup uses Subsystem4_Calibrate_From_Sensor(). */
     g_calibration.accel_x_offset = 0.0f;
     g_calibration.accel_y_offset = 0.0f;
     g_calibration.accel_z_offset = 1.0f;
@@ -87,6 +75,58 @@ bool Subsystem4_Calibrate(uint32_t timeout_ms)
     g_calibration.gyro_z_offset = 0.0f;
     g_calibration.is_calibrated = true;
 
+    return true;
+}
+
+/*
+ * Average real MPU6050 samples while the robot is motionless and level.
+ * timeout_ms is bounded by the subsystem's 3-second startup requirement.
+ * Accelerometer Z is assumed to point upward at calibration time.
+ */
+bool Subsystem4_Calibrate_From_Sensor(uint32_t timeout_ms)
+{
+    imu_raw_sample_t sample;
+    float ax_sum = 0.0f;
+    float ay_sum = 0.0f;
+    float az_sum = 0.0f;
+    float gx_sum = 0.0f;
+    float gy_sum = 0.0f;
+    float gz_sum = 0.0f;
+    uint32_t samples;
+    uint32_t index;
+
+    if ((timeout_ms < 100U) || (timeout_ms > SUBSYSTEM4_IMU_INIT_TIMEOUT_MS) ||
+        !MPU6050_IsReady()) {
+        return false;
+    }
+    samples = timeout_ms / 10U;
+    if (samples > 100U) { samples = 100U; }
+    if (samples < 10U) { samples = 10U; }
+
+    for (index = 0U; index < samples; ++index) {
+        if (!MPU6050_ReadRawSample(&sample)) {
+            return false;
+        }
+        ax_sum += (float)sample.accel_x * SUBSYSTEM4_RAW_TO_G;
+        ay_sum += (float)sample.accel_y * SUBSYSTEM4_RAW_TO_G;
+        az_sum += (float)sample.accel_z * SUBSYSTEM4_RAW_TO_G;
+        gx_sum += (float)sample.gyro_x * SUBSYSTEM4_RAW_TO_DEG_S;
+        gy_sum += (float)sample.gyro_y * SUBSYSTEM4_RAW_TO_DEG_S;
+        gz_sum += (float)sample.gyro_z * SUBSYSTEM4_RAW_TO_DEG_S;
+        if ((index + 1U) < samples) {
+            (void)tk_dly_tsk(10U);
+        }
+    }
+
+    g_calibration.accel_x_offset = ax_sum / (float)samples;
+    g_calibration.accel_y_offset = ay_sum / (float)samples;
+    g_calibration.accel_z_offset = az_sum / (float)samples;
+    g_calibration.gyro_x_offset = gx_sum / (float)samples;
+    g_calibration.gyro_y_offset = gy_sum / (float)samples;
+    g_calibration.gyro_z_offset = gz_sum / (float)samples;
+    g_calibration.is_calibrated = true;
+    g_pitch_filtered_deg = 0.0f;
+    g_roll_filtered_deg = 0.0f;
     return true;
 }
 
@@ -114,7 +154,7 @@ void Subsystem4_Filter_Step(const imu_raw_sample_t *p_raw_sample,
     float pitch_accel_deg;
     float roll_accel_deg;
 
-    if ((p_raw_sample == NULL) || (p_filtered_data == NULL)) {
+    if ((p_raw_sample == 0) || (p_filtered_data == 0)) {
         return;
     }
 
@@ -167,7 +207,7 @@ void Subsystem4_Terrain_Step(const imu_filtered_data_t *p_filtered_data,
     float delta_distance_cm;
     float pitch_rad;
 
-    if ((p_filtered_data == NULL) || (p_terrain_state == NULL)) {
+    if ((p_filtered_data == 0) || (p_terrain_state == 0)) {
         return;
     }
 

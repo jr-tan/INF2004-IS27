@@ -3,8 +3,8 @@
  * @brief Buddy 4 IMU filtering and terrain-monitoring interface.
  *
  * The module is written for the INF2004 μT-Kernel application template.
- * Sensor acquisition is deliberately kept separate: the board/sensor driver
- * supplies imu_raw_sample_t values to Subsystem4_Pipeline_Tick().
+ * The MPU6050 driver acquires real samples and the monitor task sends them
+ * through Subsystem4_Pipeline_Tick().
  */
 #ifndef SUBSYSTEM4_H
 #define SUBSYSTEM4_H
@@ -93,6 +93,8 @@ void subsystem4_test(void);
 /* Algorithm API. */
 void Subsystem4_Init(void);
 bool Subsystem4_Calibrate(uint32_t timeout_ms);
+/* Real hardware calibration: average stationary MPU6050 samples over I2C. */
+bool Subsystem4_Calibrate_From_Sensor(uint32_t timeout_ms);
 void Subsystem4_Filter_Step(const imu_raw_sample_t *p_raw_sample,
                             imu_filtered_data_t *p_filtered_data);
 void Subsystem4_Terrain_Step(const imu_filtered_data_t *p_filtered_data,
@@ -102,11 +104,12 @@ void Subsystem4_Reset_Watchdog_Recover(void);
 void Subsystem4_Set_Filter_Alpha(float alpha);
 const imu_calibration_offsets_t *Subsystem4_Get_Calibration(void);
 
-/* Process one acquired sensor sample. This is called by the sensor/task
- * integration layer; this module does not assume a particular I2C driver. */
+/* Process one acquired sample and expose the latest filtered/terrain state. */
 void Subsystem4_Pipeline_Tick(const imu_raw_sample_t *p_raw_sample,
                               uint32_t delta_distance_mm);
 const imu_filtered_data_t *Subsystem4_Get_Last_Filtered(void);
 const terrain_state_t *Subsystem4_Get_Terrain_State(void);
+
+uint32_t MPU6050_Get_Last_I2C_Abort(void);
 
 #endif /* SUBSYSTEM4_H */

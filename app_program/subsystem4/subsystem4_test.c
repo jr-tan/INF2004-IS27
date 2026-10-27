@@ -8,6 +8,8 @@
 #include <stdbool.h>
 #include <stdint.h>
 #include "subsystem4.h"
+#include "subsystem4_mpu6050.h"
+
 extern float fabsf(float x);
 
 static uint32_t g_tests_passed = 0U;
@@ -130,6 +132,51 @@ static void test_yaw_rate(void)
                 "Raw gyro value converts to approximately 90 degrees/second");
 }
 
+
+static void test_real_mpu6050(void)
+{
+    imu_raw_sample_t sample = {0};
+    imu_filtered_data_t filtered = {0};
+    terrain_state_t terrain = {0};
+
+    tm_printf((UB *)"\n=== Test 7: Physical MPU6050 integration (GP4/GP5) ===\n");
+    if (!MPU6050_Init()) {
+        TEST_ASSERT(false, "MPU6050 responds to WHO_AM_I over I2C0");
+        tm_printf((UB *)"  Connect the sensor to Grove 3 (SDA GP4, SCL GP5, 3V3, GND), then rerun.\n");
+        return;
+    }
+    TEST_ASSERT(true, "MPU6050 responds to WHO_AM_I over I2C0");
+
+    if (!MPU6050_ReadRawSample(&sample)) {
+        TEST_ASSERT(false, "A 14-byte accelerometer/gyroscope sample is readable");
+        return;
+    }
+    TEST_ASSERT(true, "A 14-byte accelerometer/gyroscope sample is readable");
+
+    Subsystem4_Init();
+    if (!Subsystem4_Calibrate_From_Sensor(1500U)) {
+        TEST_ASSERT(false, "Real-sensor calibration completes while robot is still");
+        return;
+    }
+    TEST_ASSERT(Subsystem4_Get_Calibration()->is_calibrated,
+                "Real-sensor calibration completes while robot is still");
+
+    if (!MPU6050_ReadRawSample(&sample)) {
+        TEST_ASSERT(false, "A post-calibration sample enters the filter/terrain pipeline");
+        return;
+    }
+    Subsystem4_Filter_Step(&sample, &filtered);
+    Subsystem4_Terrain_Step(&filtered, 0U, &terrain);
+    TEST_ASSERT((filtered.accel_magnitude_g > 0.5f) &&
+                (filtered.accel_magnitude_g < 1.5f),
+                "Stationary accelerometer magnitude is approximately 1 g");
+    tm_printf((UB *)"  Live sample: pitch_cdeg=%d roll_cdeg=%d accel_mg=%d\n",
+              (INT)(filtered.pitch_deg * 100.0f),
+              (INT)(filtered.roll_deg * 100.0f),
+              (INT)(filtered.accel_magnitude_g * 1000.0f));
+    tm_printf((UB *)"  For slope validation, run normal mode and slowly tilt the robot forward/backward.\n");
+}
+
 void subsystem4_test(void)
 {
     g_tests_passed = 0U;
@@ -145,6 +192,7 @@ void subsystem4_test(void)
     test_hump_height();
     test_watchdog_recovery();
     test_yaw_rate();
+    test_real_mpu6050();
 
     tm_printf((UB *)"\n===============================================\n");
     tm_printf((UB *)" TOTAL PASSED: %u\n", (UW)g_tests_passed);
