@@ -1,119 +1,37 @@
-/*
- *	task_monitor.c
- *	Subsystem 4 -- the monitor task and its alarm handler.
+/**
+ * @file task_monitor.c
+ * @brief Subsystem 4 pipeline coordinator.
  *
- *	APIs shown: tk_sta_alm, tk_stp_alm, alarm handler, tk_wai_flg,
- *	            tk_rcv_mbf, tk_loc_mtx/tk_unl_mtx, tk_ref_sem, tk_ref_mpf,
- *	            tk_ref_tsk, tk_sus_tsk, tk_rsm_tsk, tk_chg_pri,
- *	            tk_get_tid, tk_get_tim
+ * The caller provides a raw IMU sample and odometry distance increment.
+ * Physical sensor reads and μT-Kernel task scheduling belong in the board
+ * integration layer because no sensor-driver interface was provided here.
  */
-
+#include <stdint.h>
 #include "subsystem4.h"
-#include "../subsystem1/subsystem1.h"	/* IF-05: tid_led */
-#include "../subsystem2/subsystem2.h"	/* sem_slots, mpf_samples (read only) */
-#include "../subsystem3/subsystem3.h"	/* IF-04: app_stats, mtx_stats */
 
-EXPORT UW	s4_lines_received;
+static terrain_state_t g_current_terrain_state = {0};
+static imu_filtered_data_t g_last_filtered_data = {0};
 
-/*
- * Alarm handler: one-shot, interrupt context (same rules as a cyclic
- * handler: keep it short, never wait).
- */
-EXPORT void monitor_alarm_handler(void *exinf)
+void Subsystem4_Pipeline_Tick(const imu_raw_sample_t *p_raw_sample,
+                              uint32_t delta_distance_mm)
 {
-	(void)exinf;
-	tk_set_flg(flg_events, FLG_ALARM);
+    if (p_raw_sample == NULL) {
+        return;
+    }
+
+    /* Keep this pipeline step bounded; do not block or perform I/O here. */
+    Subsystem4_Filter_Step(p_raw_sample, &g_last_filtered_data);
+    Subsystem4_Terrain_Step(&g_last_filtered_data,
+                            delta_distance_mm,
+                            &g_current_terrain_state);
 }
 
-LOCAL const char *state_name(UINT tskstat)
+const imu_filtered_data_t *Subsystem4_Get_Last_Filtered(void)
 {
-	switch (tskstat) {
-	case TTS_RUN:	return "RUN";
-	case TTS_RDY:	return "READY";
-	case TTS_WAI:	return "WAIT";
-	case TTS_SUS:	return "SUSPEND";
-	case TTS_WAS:	return "WAIT+SUSPEND";
-	case TTS_DMT:	return "DORMANT";
-	default:	return "?";
-	}
+    return &g_last_filtered_data;
 }
 
-EXPORT void monitor_task(INT stacd, void *exinf)
+const terrain_state_t *Subsystem4_Get_Terrain_State(void)
 {
-	UINT		flgptn;
-	UB		text[S4_SUMMARY_MAX + 1];
-	INT		len;
-	APP_STATS	snap;
-	T_RSEM		rsem;
-	T_RMPF		rmpf;
-	T_RTSK		rtsk;
-	SYSTIM		now;
-	UW		reports = 0;
-	BOOL		led_paused = FALSE;
-	ER		er;
-
-	(void)stacd; (void)exinf;
-
-	tm_printf((UB*)"monitor: I am task %d\n", tk_get_tid());
-
-	while (1) {
-		/* 1. Arm the one-shot alarm, then wait for EITHER bit.
-		      TWF_ORW = wake on any of the bits, TWF_CLR = clear them
-		      on wake-up.  The extra timeout is just a safety net. */
-		tk_sta_alm(alm_monitor, S4_ALARM_MS);
-		er = tk_wai_flg(flg_events, FLG_ALARM | FLG_BATCH,
-				TWF_ORW | TWF_CLR, &flgptn, S4_ALARM_MS * 2);
-		tk_stp_alm(alm_monitor);	/* cancel it if a batch came first */
-
-		if (er == E_TMOUT) {
-			tm_printf((UB*)"monitor: nothing at all happened?\n");
-			continue;
-		}
-		if (flgptn & FLG_ALARM) {
-			tm_printf((UB*)"monitor: alarm -- no batch for %d ms\n",
-				  S4_ALARM_MS);
-		}
-
-		/* 2. Drain the message buffer without waiting (TMO_POL).
-		      tk_rcv_mbf returns the message length, or an error. */
-		while ((len = tk_rcv_mbf(mbf_summary, text, TMO_POL)) > 0) {
-			text[len] = '\0';
-			s4_lines_received++;
-			tm_printf((UB*)"monitor: batch  %s\n", text);
-		}
-
-		/* 3. Copy the stats under subsystem 3's mutex, print outside
-		      it: hold a mutex for as short a time as possible. */
-		tk_loc_mtx(mtx_stats, TMO_FEVR);
-		snap = app_stats;
-		tk_unl_mtx(mtx_stats);
-
-		tk_get_tim(&now);
-		tk_ref_sem(sem_slots, &rsem);
-		tk_ref_mpf(mpf_samples, &rmpf);
-		tm_printf((UB*)"monitor: t=%u ms  samples=%u  min=%d max=%d avg=%d"
-			  "  free slots=%d  free blocks=%d\n",
-			  now.lo, snap.received, snap.min, snap.max,
-			  snap.received ? (INT)(snap.sum / (W)snap.received) : 0,
-			  rsem.semcnt, (INT)rmpf.frbcnt);
-
-		/* 4. Every few reports, pause or resume subsystem 1's LED task
-		      (IF-05) and look at it with tk_ref_tsk. */
-		if (++reports % S4_LED_TOGGLE_REPORTS == 0) {
-			if (led_paused) {
-				tk_rsm_tsk(tid_led);
-				tk_chg_pri(tid_led, S1_PRI_LED);	/* back to normal */
-			} else {
-				tk_sus_tsk(tid_led);
-				/* Changing the priority of a task: */
-				tk_chg_pri(tid_led, S1_PRI_LED + 1);
-			}
-			led_paused = !led_paused;
-
-			tk_ref_tsk(tid_led, &rtsk);
-			tm_printf((UB*)"monitor: LED task %s, state=%s, pri=%d\n",
-				  led_paused ? "paused" : "resumed",
-				  state_name(rtsk.tskstat), rtsk.tskpri);
-		}
-	}
+    return &g_current_terrain_state;
 }

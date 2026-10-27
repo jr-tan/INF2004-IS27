@@ -75,12 +75,14 @@ ifneq ($(strip $(C_DEPS)),)
 endif
 endif
 
+LFLAGS += --specs=nosys.specs
+
 # All EXE_FILE
 all: $(EXE_FILE).elf
 
 $(EXE_FILE).elf: $(OBJS)
 	@echo 'Linker: $@'
-	$(LINK)  $(LFLAGS) -T $(LNKFILE) -Wl,-Map,"$(EXE_FILE).map" -o "$(EXE_FILE).elf" $(OBJS)
+	$(LINK)  $(LFLAGS) -T $(LNKFILE) -Wl,-Map,"$(EXE_FILE).map" -o "$(EXE_FILE).elf" $(OBJS) -lm
 	@echo 'Finished building target: $@'
 ifneq ($(SIZE),)
 	$(SIZE) $(EXE_FILE).elf
