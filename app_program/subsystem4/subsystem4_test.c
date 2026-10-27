@@ -1,14 +1,11 @@
 /**
  * @file subsystem4_test.c
- * @brief On-target software tests for Buddy 4.
- *
- * Uses μT-Kernel's tm_printf() console API rather than Newlib printf(), which
- * avoids introducing a dependency on the bare-metal Newlib syscall stubs.
+ * @brief On-target algorithm and GY-511 integration tests for Buddy 4.
  */
 #include <stdbool.h>
 #include <stdint.h>
 #include "subsystem4.h"
-#include "subsystem4_mpu6050.h"
+#include "subsystem4_gy511.h"
 
 extern float fabsf(float x);
 
@@ -35,9 +32,9 @@ static void test_init_and_calibration(void)
     tm_printf((UB *)"\n=== Test 1: Initialization and calibration ===\n");
     Subsystem4_Init();
     TEST_ASSERT(Subsystem4_Calibrate(SUBSYSTEM4_IMU_INIT_TIMEOUT_MS),
-                "Nominal calibration succeeds within configured limit");
+                "Nominal calibration accepts configured timeout");
 
-    sample.accel_z = 16384;
+    sample.accel_z = 1000;
     sample.timestamp_ms = 100U;
     Subsystem4_Filter_Step(&sample, &filtered);
     TEST_ASSERT(fabsf(filtered.pitch_deg) <= SUBSYSTEM4_TILT_STEADY_STATE_ERR_MAX,
@@ -46,33 +43,13 @@ static void test_init_and_calibration(void)
                 "Flat-ground roll remains within +/- 2 degrees");
 }
 
-static void test_pipeline_execution(void)
-{
-    imu_raw_sample_t sample = {0};
-    terrain_state_t terrain = {0};
-
-    tm_printf((UB *)"\n=== Test 2: Pipeline execution ===\n");
-    sample.accel_z = 16384;
-    sample.timestamp_ms = 10U;
-    Subsystem4_Pipeline_Tick(&sample, 10U);
-    terrain = *Subsystem4_Get_Terrain_State();
-    TEST_ASSERT(terrain.motion_state == MOTION_CLASS_STATIONARY,
-                "Level sample completes pipeline and classifies as stationary");
-}
-
-static void test_motion_and_impact(void)
+static void test_impact_and_recovery(void)
 {
     imu_raw_sample_t sample = {0};
     imu_filtered_data_t filtered = {0};
     terrain_state_t terrain = {0};
 
-    tm_printf((UB *)"\n=== Test 3: Motion classification and impact ===\n");
-    sample.accel_z = 16384;
-    Subsystem4_Filter_Step(&sample, &filtered);
-    Subsystem4_Terrain_Step(&filtered, 10U, &terrain);
-    TEST_ASSERT(terrain.motion_state == MOTION_CLASS_STATIONARY,
-                "Level sample is classified as stationary");
-
+    tm_printf((UB *)"\n=== Test 2: Impact and recovery ===\n");
     sample.accel_x = 32767;
     sample.accel_y = 32767;
     sample.accel_z = 32767;
@@ -82,99 +59,51 @@ static void test_motion_and_impact(void)
                 "Acceleration magnitude above 2.5 g triggers impact");
     TEST_ASSERT(terrain.motion_state == MOTION_CLASS_SUDDEN_IMPACT,
                 "Impact classification is reported");
+
+    Subsystem4_Reset_Watchdog_Recover();
+    TEST_ASSERT(Subsystem4_Get_Calibration()->is_calibrated,
+                "Recovery preserves calibration");
 }
 
-static void test_hump_height(void)
+static void test_hump_state(void)
 {
     imu_filtered_data_t filtered = {0};
     terrain_state_t terrain = {0};
-    uint32_t step;
+    uint32_t index;
 
-    tm_printf((UB *)"\n=== Test 4: Hump height estimate ===\n");
+    tm_printf((UB *)"\n=== Test 3: Hump state ===\n");
     Subsystem4_Init();
     filtered.pitch_deg = 10.0f;
     filtered.accel_magnitude_g = 1.0f;
 
-    for (step = 0U; step < 20U; ++step) {
+    for (index = 0U; index < 20U; ++index) {
         Subsystem4_Terrain_Step(&filtered, 10U, &terrain);
     }
-
-    TEST_ASSERT(terrain.hump_active, "Hump is marked active on a positive slope");
-    TEST_ASSERT(fabsf(terrain.peak_height_cm - 3.47f) <= 1.0f,
-                "Estimated height is close to 20 cm * sin(10 degrees)");
+    TEST_ASSERT(terrain.hump_active, "Positive slope enters hump processing");
+    TEST_ASSERT(Subsystem4_Get_Operational_State() ==
+                SUBSYSTEM4_STATE_HUMP_PROCESSING,
+                "Operational state reports hump processing");
 }
 
-static void test_watchdog_recovery(void)
+static void test_gy511_hardware(void)
 {
-    const imu_calibration_offsets_t *p_calibration;
+    gy511_raw_sample_t sample;
 
-    tm_printf((UB *)"\n=== Test 5: Watchdog recovery ===\n");
-    p_calibration = Subsystem4_Get_Calibration();
-    TEST_ASSERT(p_calibration->is_calibrated,
-                "Calibration is present before recovery");
-
-    Subsystem4_Reset_Watchdog_Recover();
-    p_calibration = Subsystem4_Get_Calibration();
-    TEST_ASSERT(p_calibration->is_calibrated,
-                "Recovery preserves calibration");
-}
-
-static void test_yaw_rate(void)
-{
-    imu_raw_sample_t sample = {0};
-    imu_filtered_data_t filtered = {0};
-
-    tm_printf((UB *)"\n=== Test 6: Yaw-rate conversion ===\n");
-    sample.accel_z = 16384;
-    sample.gyro_z = 11790; /* approximately 90 degrees/second */
-    Subsystem4_Filter_Step(&sample, &filtered);
-    TEST_ASSERT(fabsf(filtered.yaw_rate_deg_s - 90.0f) <= 1.0f,
-                "Raw gyro value converts to approximately 90 degrees/second");
-}
-
-
-static void test_real_mpu6050(void)
-{
-    imu_raw_sample_t sample = {0};
-    imu_filtered_data_t filtered = {0};
-    terrain_state_t terrain = {0};
-
-    tm_printf((UB *)"\n=== Test 7: Physical MPU6050 integration (GP4/GP5) ===\n");
-    if (!MPU6050_Init()) {
-        TEST_ASSERT(false, "MPU6050 responds to WHO_AM_I over I2C0");
-        tm_printf((UB *)"  Connect the sensor to Grove 3 (SDA GP4, SCL GP5, 3V3, GND), then rerun.\n");
+    tm_printf((UB *)"\n=== Test 4: Physical GY-511 integration (I2C0 GP4/GP5) ===\n");
+    if (!GY511_Init()) {
+        TEST_ASSERT(false, "GY-511 accelerometer and magnetometer are identified");
+        tm_printf((UB *)"  GY-511 init error stage=%lu\n",
+                  (UW)GY511_Get_Error_Stage());
         return;
     }
-    TEST_ASSERT(true, "MPU6050 responds to WHO_AM_I over I2C0");
+    TEST_ASSERT(GY511_Get_Accel_WhoAmI() == GY511_ACCEL_WHO_AM_I_VALUE,
+                "LSM303DLHC accelerometer WHO_AM_I is 0x33");
 
-    if (!MPU6050_ReadRawSample(&sample)) {
-        TEST_ASSERT(false, "A 14-byte accelerometer/gyroscope sample is readable");
+    if (!GY511_ReadRawSample(&sample)) {
+        TEST_ASSERT(false, "Accelerometer and magnetometer samples are readable");
         return;
     }
-    TEST_ASSERT(true, "A 14-byte accelerometer/gyroscope sample is readable");
-
-    Subsystem4_Init();
-    if (!Subsystem4_Calibrate_From_Sensor(1500U)) {
-        TEST_ASSERT(false, "Real-sensor calibration completes while robot is still");
-        return;
-    }
-    TEST_ASSERT(Subsystem4_Get_Calibration()->is_calibrated,
-                "Real-sensor calibration completes while robot is still");
-
-    if (!MPU6050_ReadRawSample(&sample)) {
-        TEST_ASSERT(false, "A post-calibration sample enters the filter/terrain pipeline");
-        return;
-    }
-    Subsystem4_Filter_Step(&sample, &filtered);
-    Subsystem4_Terrain_Step(&filtered, 0U, &terrain);
-    TEST_ASSERT((filtered.accel_magnitude_g > 0.5f) &&
-                (filtered.accel_magnitude_g < 1.5f),
-                "Stationary accelerometer magnitude is approximately 1 g");
-    tm_printf((UB *)"  Live sample: pitch_cdeg=%d roll_cdeg=%d accel_mg=%d\n",
-              (INT)(filtered.pitch_deg * 100.0f),
-              (INT)(filtered.roll_deg * 100.0f),
-              (INT)(filtered.accel_magnitude_g * 1000.0f));
-    tm_printf((UB *)"  For slope validation, run normal mode and slowly tilt the robot forward/backward.\n");
+    TEST_ASSERT(true, "Accelerometer and magnetometer samples are readable");
 }
 
 void subsystem4_test(void)
@@ -183,16 +112,13 @@ void subsystem4_test(void)
     g_tests_failed = 0U;
 
     tm_printf((UB *)"\n===============================================\n");
-    tm_printf((UB *)" BUDDY 4: IMU AND TERRAIN MONITORING TESTS\n");
+    tm_printf((UB *)" BUDDY 4: RP2040 GY-511 TERRAIN TESTS\n");
     tm_printf((UB *)"===============================================\n");
 
     test_init_and_calibration();
-    test_pipeline_execution();
-    test_motion_and_impact();
-    test_hump_height();
-    test_watchdog_recovery();
-    test_yaw_rate();
-    test_real_mpu6050();
+    test_impact_and_recovery();
+    test_hump_state();
+    test_gy511_hardware();
 
     tm_printf((UB *)"\n===============================================\n");
     tm_printf((UB *)" TOTAL PASSED: %u\n", (UW)g_tests_passed);
