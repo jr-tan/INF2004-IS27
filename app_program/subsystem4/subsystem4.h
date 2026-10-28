@@ -1,11 +1,12 @@
 /**
  * @file subsystem4.h
- * @brief Buddy 4 terrain monitoring interface for RP2040 and GY-511.
+ * @brief Buddy 4 terrain monitoring, binary telemetry, and Tribunal 1 interfaces.
  *
- * Barr-C style notes:
- * - Private state and helper functions are file-local.
- * - Public interfaces use explicit types and pointer validation.
- * - Hardware and application integration are separated from algorithms.
+ * Barr-C & Tribunal 1 compliance notes:
+ * - All cross-subsystem and MQTT wire structures are packed via explicit masks
+ *   and shifts in little-endian byte order (no compiler-dependent C bit-fields).
+ * - Shared 32-bit fault/odometry words use RP2040 hardware spinlocks with
+ *   interrupt-safe acquisition to prevent Read-Modify-Write race conditions.
  */
 #ifndef SUBSYSTEM4_H
 #define SUBSYSTEM4_H
@@ -14,22 +15,54 @@
 #include <stdint.h>
 #include "../app.h"
 
+/* Timing & algorithm constants */
 #define SUBSYSTEM4_IMU_INIT_TIMEOUT_MS       (3000U)
 #define SUBSYSTEM4_TILT_STEADY_STATE_ERR_MAX (2.0f)
 #define SUBSYSTEM4_DEFAULT_FILTER_ALPHA      (0.80f)
+#define SUBSYSTEM4_DEFAULT_RAW_LPF_BETA      (0.30f)
 #define SUBSYSTEM4_SAMPLE_PERIOD_MS          (10U)
-#define SUBSYSTEM4_HUMP_ENTRY_PITCH_DEG      (5.0f)
+#define SUBSYSTEM4_HUMP_ENTRY_PITCH_DEG      (3.0f)
+#define SUBSYSTEM4_HUMP_EXIT_PITCH_DEG       (0.8f)
+#define SUBSYSTEM4_HUMP_ENTRY_MIN_SAMPLES    (3U)    /* A6: 30 ms persistence check */
 #define SUBSYSTEM4_ALERT_PITCH_DEG           (15.0f)
-#define SUBSYSTEM4_IMPACT_ACCEL_THRESHOLD_G  (2.5f)
+#define SUBSYSTEM4_IMPACT_ACCEL_THRESHOLD_G  (5.0f)
 #define SUBSYSTEM4_DEG_TO_RAD                (0.017453292519943295f)
 #define SUBSYSTEM4_RAD_TO_DEG                (57.29577951308232f)
-#define SUBSYSTEM4_GY511_ACCEL_RAW_TO_G       (0.001f) /* 1 mg/LSB in HR mode */
+#define SUBSYSTEM4_GY511_ACCEL_RAW_TO_G      (0.001f) /* 1 mg/LSB in HR/2g mode */
+#define SUBSYSTEM4_GRAVITY_MM_S2             (9806.65f)
 
-#define SUBSYSTEM4_EVT_TILT          (0x0001U)
-#define SUBSYSTEM4_EVT_SUDDEN_IMPACT (0x0002U)
-#define SUBSYSTEM4_EVT_INIT_DONE     (0x0004U)
-#define SUBSYSTEM4_EVT_STATE_CHANGE  (0x0008U)
-#define SUBSYSTEM4_EVT_HUMP_EXIT     (0x0010U)
+/* Local terrain event flags */
+#define SUBSYSTEM4_EVT_TILT                  (0x0001U)
+#define SUBSYSTEM4_EVT_SUDDEN_IMPACT         (0x0002U)
+#define SUBSYSTEM4_EVT_INIT_DONE             (0x0004U)
+#define SUBSYSTEM4_EVT_STATE_CHANGE          (0x0008U)
+#define SUBSYSTEM4_EVT_HUMP_EXIT             (0x0010U)
+
+/*
+ * Tribunal 1 Shared Consolidated Fault Bitmask (sys_fault_flg)
+ * Bit 0: IMU_I2C_FAULT (imu_acquire_task)
+ * Bit 1: IMU_CALIB_FAULT (imu_acquire_task)
+ * Bit 2: TILT_EXCEEDED_FAULT (terrain_analysis_task)
+ * Bit 3: SUDDEN_IMPACT (terrain_analysis_task - verified in 50x injection test)
+ * Bit 4: NO_ECHO (Buddy 5)
+ * Bit 5: AVOID_FAULT (Buddy 5)
+ */
+#define SYS_FAULT_BIT_IMU_I2C                (1UL << 0)
+#define SYS_FAULT_BIT_IMU_CALIB              (1UL << 1)
+#define SYS_FAULT_BIT_TILT_ALERT             (1UL << 2)
+#define SYS_FAULT_BIT_SUDDEN_IMPACT          (1UL << 3)
+#define SYS_FAULT_BIT_NO_ECHO                (1UL << 4)
+#define SYS_FAULT_BIT_AVOID_FAULT            (1UL << 5)
+
+/* Tribunal 1 Dual Telemetry Pool Sizing (76.6% reduction from 2048 B to 480 B) */
+#define SUBSYSTEM4_TLM_BLOCK_BYTES           (16U)
+#define SUBSYSTEM4_TLM_DATA_POOL_BLOCKS      (24U)   /* 24 * 16 B = 384 B */
+#define SUBSYSTEM4_TLM_FAULT_POOL_BLOCKS     (6U)    /*  6 * 16 B =  96 B */
+#define SUBSYSTEM4_TLM_PAYLOAD_BYTES         (8U)    /* 64-bit wire packet */
+
+/* Binary MQTT Message Types (3 bits: 0..7) */
+#define SUBSYSTEM4_MSG_TYPE_TERRAIN_TLM      (4U)
+#define SUBSYSTEM4_MSG_TYPE_FAULT_EVENT      (7U)
 
 typedef enum {
     MOTION_CLASS_STATIONARY = 0U,
@@ -61,9 +94,9 @@ typedef struct {
 typedef struct {
     float pitch_deg;
     float roll_deg;
-    /* Not a gyro rate: magnetometer-derived heading delta, when available. */
     float yaw_rate_deg_s;
     float accel_magnitude_g;
+    float forward_accel_g;
     float heading_deg;
     bool heading_valid;
     uint32_t timestamp_ms;
@@ -82,18 +115,73 @@ typedef struct {
 typedef struct {
     float current_pitch;
     float current_roll;
+    float current_height_cm;
     float peak_height_cm;
+    float last_hump_height_cm;
     float yaw_rate_deg_s;
     motion_class_t motion_state;
     bool sudden_impact_flag;
     bool hump_active;
+    uint32_t hump_count;
     uint32_t event_flags;
 } terrain_state_t;
 
+/**
+ * @brief Decoded representation of the 8-byte binary terrain telemetry packet.
+ *
+ * Wire bit layout (64 bits total, little-endian):
+ * - Word 0 (Bits  0..31):
+ *   - Bits  0..2  (3 bits) : msg_type (SUBSYSTEM4_MSG_TYPE_TERRAIN_TLM = 4)
+ *   - Bits  3..22 (20 bits): timestamp_ms (0..1,048,575 ms)
+ *   - Bits 23..25 (3 bits) : motion_state (0..5)
+ *   - Bit  26     (1 bit)  : hump_active (0..1)
+ *   - Bit  27     (1 bit)  : sudden_impact (0..1)
+ *   - Bits 28..31 (4 bits) : fault_summary (lower 4 bits of sys_fault_flg)
+ * - Word 1 (Bits 32..63):
+ *   - Bits  0..9  (10 bits): pitch_tenth_deg_enc (-45.0..+45.0 deg, offset +512, 0.1 deg/LSB)
+ *   - Bits 10..19 (10 bits): roll_tenth_deg_enc  (-45.0..+45.0 deg, offset +512, 0.1 deg/LSB)
+ *   - Bits 20..29 (10 bits): peak_height_mm      (0..1023 mm -> 0.0..102.3 cm, 1 mm/LSB)
+ *   - Bits 30..31 (2 bits) : op_state_low        (operational state & 0x3)
+ */
+typedef struct {
+    uint8_t msg_type;
+    uint32_t timestamp_ms;
+    motion_class_t motion_state;
+    bool hump_active;
+    bool sudden_impact;
+    uint8_t fault_summary;
+    float pitch_deg;
+    float roll_deg;
+    float peak_height_cm;
+    uint8_t op_state;
+} subsystem4_tlm_decoded_t;
+
+/**
+ * @brief Fixed 16-byte memory pool block used in tlm_data_mpf and tlm_fault_mpf.
+ * First 4 bytes = T_MSG header for μT-Kernel tk_snd_mbx / tk_rcv_mbx.
+ */
+typedef struct {
+    T_MSG msg_header;
+    uint8_t is_fault_block;
+    uint8_t payload_len;
+    uint16_t seq_num;
+    uint8_t payload[SUBSYSTEM4_TLM_PAYLOAD_BYTES];
+} subsystem4_tlm_block_t;
+
+typedef struct {
+    uint32_t data_packets_sent;
+    uint32_t data_packets_overwritten;
+    uint32_t fault_packets_sent;
+    uint32_t fault_packets_dropped;
+    uint32_t active_fault_mask;
+} subsystem4_telemetry_stats_t;
+
+/* Standard template lifecycle entry points */
 ER subsystem4_init(void);
 ER subsystem4_start(void);
 void subsystem4_test(void);
 
+/* Core algorithm API */
 void Subsystem4_Init(void);
 bool Subsystem4_Calibrate(uint32_t timeout_ms);
 bool Subsystem4_Calibrate_From_Sensor(uint32_t timeout_ms);
@@ -104,10 +192,47 @@ void Subsystem4_Terrain_Step(const imu_filtered_data_t *p_filtered_data,
                              terrain_state_t *p_terrain_state);
 void Subsystem4_Reset_Watchdog_Recover(void);
 void Subsystem4_Set_Filter_Alpha(float alpha);
+void Subsystem4_Set_Raw_LPF_Beta(float beta);
 const imu_calibration_offsets_t *Subsystem4_Get_Calibration(void);
 void Subsystem4_Request_Abort_Reset(void);
 subsystem4_operational_state_t Subsystem4_Get_Operational_State(void);
 
+/* Buddy 2 Wheel Odometry Coupling API */
+void Subsystem4_Update_Odometry_Mm(uint32_t delta_distance_mm);
+uint32_t Subsystem4_Consume_Odometry_Mm(void);
+
+/* Tribunal 1 Shared Fault Bitmask API (RP2040 Hardware Spinlock Protected) */
+void Subsystem4_Fault_Set_Bits(uint32_t mask);
+void Subsystem4_Fault_Clear_Bits(uint32_t mask);
+uint32_t Subsystem4_Fault_Get_Mask(void);
+
+/* Binary Packing / Unpacking API (Explicit Masks & Shifts, Little-Endian) */
+void Subsystem4_Pack_Telemetry(const terrain_state_t *p_terrain,
+                               uint32_t timestamp_ms,
+                               uint8_t out_bytes[SUBSYSTEM4_TLM_PAYLOAD_BYTES]);
+void Subsystem4_Unpack_Telemetry(const uint8_t in_bytes[SUBSYSTEM4_TLM_PAYLOAD_BYTES],
+                                 subsystem4_tlm_decoded_t *p_decoded);
+void Subsystem4_Pack_Fault(uint32_t fault_mask,
+                           uint32_t timestamp_ms,
+                           int16_t peak_accel_mg,
+                           uint8_t out_bytes[SUBSYSTEM4_TLM_PAYLOAD_BYTES]);
+void Subsystem4_Unpack_Fault(const uint8_t in_bytes[SUBSYSTEM4_TLM_PAYLOAD_BYTES],
+                             uint32_t *p_fault_mask,
+                             uint32_t *p_timestamp_ms,
+                             int16_t *p_peak_accel_mg);
+
+/* Non-blocking Telemetry Pool & Mailbox Dispatch API */
+ER Subsystem4_Telemetry_Init(void);
+bool Subsystem4_Telemetry_Send_State(const terrain_state_t *p_terrain,
+                                     uint32_t timestamp_ms);
+bool Subsystem4_Telemetry_Send_Fault(uint32_t fault_mask,
+                                     uint32_t timestamp_ms,
+                                     int16_t peak_accel_mg);
+bool Subsystem4_Telemetry_Pop_Packet(uint8_t out_bytes[SUBSYSTEM4_TLM_PAYLOAD_BYTES],
+                                     bool *p_is_fault);
+void Subsystem4_Telemetry_Get_Stats(subsystem4_telemetry_stats_t *p_stats);
+
+/* Pipeline state getters */
 void Subsystem4_Pipeline_Tick(const imu_raw_sample_t *p_raw_sample,
                               uint32_t delta_distance_mm);
 const imu_filtered_data_t *Subsystem4_Get_Last_Filtered(void);

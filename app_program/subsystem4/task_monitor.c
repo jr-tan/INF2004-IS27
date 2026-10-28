@@ -1,14 +1,7 @@
 /**
  * @file task_monitor.c
- * @brief Event-driven acquisition -> filter -> terrain pipeline for GY-511.
- *
- * Stage 1 deliberately uses a timed semaphore wait as a polling fallback:
- * - If the confirmed GY-511 DRDY ISR signals the semaphore, acquisition wakes
- *   immediately.
- * - If no ISR is connected, the wait times out every 10 ms and acquisition
- *   polls the sensor. This keeps the pipeline testable without guessing a pin.
- *
- * The GY-511 (LSM303DLHC) has accelerometer + magnetometer, no gyro and no FIFO.
+ * @brief Event-driven acquisition -> filter -> terrain pipeline for GY-511
+ *        with binary telemetry dispatch and 20 ms emergency impact signaling.
  */
 #include <stdint.h>
 #include <tk/tkernel.h>
@@ -20,12 +13,14 @@
 #define S4_SAMPLE_PERIOD_MS          (10U)
 #define S4_QUEUE_WAIT_MS             (20)
 #define S4_PRINT_EVERY_N_SAMPLES     (10U)
+#define S4_TLM_PERIODIC_SAMPLES      (20U) /* 200 ms routine binary telemetry */
 #define S4_RAW_QUEUE_BYTES           (sizeof(imu_raw_sample_t) * 8U)
 #define S4_FILTERED_QUEUE_BYTES      (sizeof(imu_filtered_data_t) * 8U)
 
 static ID g_raw_mbf_id = 0;
 static ID g_filtered_mbf_id = 0;
 static ID g_data_ready_sem_id = 0;
+static ID g_sys_evt_flg_id = 0;
 static ID g_acquire_task_id = 0;
 static ID g_filter_task_id = 0;
 static ID g_terrain_task_id = 0;
@@ -33,16 +28,16 @@ static terrain_state_t g_current_terrain_state;
 static imu_filtered_data_t g_last_filtered_data;
 static bool g_pipeline_started = false;
 
-/*
- * Integration hook for a verified DRDY ISR.
- * tk_sig_sem is intended to be the only RTOS action in this ISR hook.
- * Do not call this from a GPIO interrupt until ISR API rules are confirmed.
- */
 void Subsystem4_Notify_Data_Ready_From_ISR(void)
 {
     if (g_data_ready_sem_id > 0) {
         (void)tk_sig_sem(g_data_ready_sem_id, 1);
     }
+}
+
+ID Subsystem4_Get_System_Event_Flag_ID(void)
+{
+    return g_sys_evt_flg_id;
 }
 
 static void subsystem4_acquisition_task(INT stacd, void *exinf)
@@ -69,13 +64,12 @@ static void subsystem4_acquisition_task(INT stacd, void *exinf)
                 (void)tk_dly_tsk(250U);
                 continue;
             }
+            if (g_sys_evt_flg_id > 0) {
+                (void)tk_set_flg(g_sys_evt_flg_id, SUBSYSTEM4_EVT_INIT_DONE);
+            }
             tm_printf((UB *)"S4: calibration complete\n");
         }
 
-        /*
-         * Event-driven when a DRDY ISR is connected; timed polling fallback
-         * otherwise. Timeout is expected, not an error.
-         */
         rc = tk_wai_sem(g_data_ready_sem_id, 1, (TMO)S4_SAMPLE_PERIOD_MS);
         if ((rc != E_OK) && (rc != E_TMOUT)) {
             tm_printf((UB *)"S4: data-ready semaphore wait error=%d\n", rc);
@@ -102,7 +96,6 @@ static void subsystem4_acquisition_task(INT stacd, void *exinf)
 
         rc = tk_snd_mbf(g_raw_mbf_id, &sample, (INT)sizeof(sample), TMO_POL);
         if (rc < E_OK) {
-            /* Queue full: drop this sample instead of blocking acquisition. */
             continue;
         }
     }
@@ -124,9 +117,10 @@ static void subsystem4_filter_task(INT stacd, void *exinf)
         }
 
         Subsystem4_Filter_Step(&raw_sample, &filtered_data);
+                Subsystem4_Filter_Step(&raw_sample, &filtered_data);
+       
         rc = tk_snd_mbf(g_filtered_mbf_id, &filtered_data, (INT)sizeof(filtered_data), TMO_POL);
         if (rc < E_OK) {
-            /* Preserve freshness: don't stall the filter task on a full queue. */
             continue;
         }
     }
@@ -136,6 +130,7 @@ static void subsystem4_terrain_task(INT stacd, void *exinf)
 {
     imu_filtered_data_t filtered_data;
     uint32_t sample_count = 0U;
+    uint32_t odom_mm;
     INT rc;
 
     (void)stacd;
@@ -148,18 +143,32 @@ static void subsystem4_terrain_task(INT stacd, void *exinf)
         }
 
         g_last_filtered_data = filtered_data;
-        /* No wheel odometry interface is available in this template snapshot. */
-        Subsystem4_Terrain_Step(&filtered_data, 0U, &g_current_terrain_state);
+        odom_mm = Subsystem4_Consume_Odometry_Mm();
+        Subsystem4_Terrain_Step(&filtered_data, odom_mm, &g_current_terrain_state);
+
+        /* Propagate event bits to sys_evt_flg within 20 ms handoff budget */
+        if ((g_sys_evt_flg_id > 0) && (g_current_terrain_state.event_flags != 0U)) {
+            (void)tk_set_flg(g_sys_evt_flg_id, g_current_terrain_state.event_flags);
+        }
+
+        /* Periodic non-blocking binary telemetry snapshot every 200 ms */
+        if ((sample_count % S4_TLM_PERIODIC_SAMPLES) == 0U) {
+            (void)Subsystem4_Telemetry_Send_State(&g_current_terrain_state,
+                                                  filtered_data.timestamp_ms);
+        }
 
         if ((sample_count % S4_PRINT_EVERY_N_SAMPLES) == 0U) {
-            tm_printf((UB *)"S4 pitch_cdeg=%d roll_cdeg=%d heading_cdeg=%d accel_mg=%d state=%d impact=%d\n",
+            subsystem4_telemetry_stats_t stats;
+            Subsystem4_Telemetry_Get_Stats(&stats);
+            tm_printf((UB *)"S4 pitch_cdeg=%d roll_cdeg=%d hump_mm=%d state=%d impact=%d fault=0x%02x tlm_tx=%u\n",
                       (INT)(filtered_data.pitch_deg * 100.0f),
                       (INT)(filtered_data.roll_deg * 100.0f),
-                      (INT)(filtered_data.heading_deg * 100.0f),
-                      (INT)(filtered_data.accel_magnitude_g * 1000.0f),
+                      (INT)(g_current_terrain_state.peak_height_cm * 10.0f),
                       (INT)g_current_terrain_state.motion_state,
-                      (INT)(g_current_terrain_state.sudden_impact_flag ? 1 : 0));
-        }
+                      (INT)(g_current_terrain_state.sudden_impact_flag ? 1 : 0),
+                      (UW)stats.active_fault_mask,
+                      (UW)stats.data_packets_sent);}
+    
         ++sample_count;
     }
 }
@@ -178,12 +187,18 @@ ER Subsystem4_Start_Pipeline_Tasks(void)
 {
     T_CMBF mbf_cfg;
     T_CSEM sem_cfg;
+    T_CFLG flg_cfg;
+    ER rc;
 
     if (g_pipeline_started) {
         return E_OK;
     }
 
-    /* Queue IDs and semaphore are created locally to avoid guessed project IDs. */
+    rc = Subsystem4_Telemetry_Init();
+    if (rc < E_OK) {
+        return rc;
+    }
+
     mbf_cfg.exinf = NULL;
     mbf_cfg.mbfatr = TA_TFIFO;
     mbf_cfg.bufsz = (INT)S4_RAW_QUEUE_BYTES;
@@ -210,6 +225,14 @@ ER Subsystem4_Start_Pipeline_Tasks(void)
         return (ER)g_data_ready_sem_id;
     }
 
+    flg_cfg.exinf = NULL;
+    flg_cfg.flgatr = TA_TFIFO | TA_WMUL;
+    flg_cfg.iflgptn = 0U;
+    g_sys_evt_flg_id = tk_cre_flg(&flg_cfg);
+    if (g_sys_evt_flg_id < E_OK) {
+        return (ER)g_sys_evt_flg_id;
+    }
+
     g_acquire_task_id = app_start_task((FP)subsystem4_acquisition_task,
                                        S4_TASK_PRIORITY, TP_PRC1, "s4_acq");
     if (g_acquire_task_id < E_OK) {
@@ -232,7 +255,6 @@ ER Subsystem4_Start_Pipeline_Tasks(void)
     return E_OK;
 }
 
-/* Compatibility entry point used by subsystem4.c. */
 ID Subsystem4_Start_Sensor_Task(void)
 {
     ER rc = Subsystem4_Start_Pipeline_Tasks();
