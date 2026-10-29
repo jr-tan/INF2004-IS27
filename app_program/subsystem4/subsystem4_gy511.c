@@ -256,6 +256,45 @@ static int16_t signed_le16(uint8_t low, uint8_t high)
     return (int16_t)((((uint16_t)high) << 8) | (uint16_t)low);
 }
 
+
+/*
+ * Temporary GY-511 / LSM303DLHC diagnostic.
+ *
+ * Checks:
+ *   WHO_AM_I_A   (0x0F) -> expected 0x33
+ *   CTRL_REG1_A  (0x20) -> expected 0x57
+ *   CTRL_REG3_A  (0x22) -> expected 0x10
+ *   STATUS_REG_A (0x27) -> observe data-ready status
+ *
+ * IMPORTANT:
+ * Replace i2c0_read_reg() below with the exact name/signature
+ * of your existing I2C register-read helper if it differs.
+ */
+
+static void GY511_Diagnostic(void)
+{
+    uint8_t i;
+    uint8_t who = 0U;
+    bool ok_who;
+
+    for (i = 0U; i < 5U; i++) {
+        who = 0U;
+
+        ok_who = i2c0_read_regs(
+            GY511_ACCEL_I2C_ADDRESS,
+            0x0FU,
+            &who,
+            1U
+        );
+
+        tm_printf((UB *)"S4: WHO[%u] ok=%u value=%02X\r\n",
+                  (UW)i, (UW)ok_who, (UW)who);
+
+        (void)tk_dly_tsk(20U);
+    }
+}
+
+
 bool GY511_Init(void)
 {
     uint8_t who_am_i = 0U;
@@ -304,6 +343,56 @@ bool GY511_Init(void)
             break;
         }
 
+        /* CTRL_REG3_A (0x22): route accelerometer DRDY1 to INT1 */
+        if (!i2c0_write_reg(GY511_ACCEL_I2C_ADDRESS, 0x22U, 0x04U)) {
+            g_error_stage = 6U;
+            break;
+        }
+
+        uint8_t ctrl1 = 0U;
+        uint8_t ctrl3 = 0U;
+
+        (void)i2c0_read_regs(GY511_ACCEL_I2C_ADDRESS, 0x20U, &ctrl1, 1U);
+        (void)i2c0_read_regs(GY511_ACCEL_I2C_ADDRESS, 0x22U, &ctrl3, 1U);
+
+        tm_printf((UB *)"S4: CTRL1_A=%02X CTRL3_A=%02X\n", ctrl1, ctrl3);
+
+        uint8_t ctrl3_a = 0U;
+        uint8_t status_a = 0U;
+
+        if (!i2c0_read_regs(GY511_ACCEL_I2C_ADDRESS,
+                            0x22U, &ctrl3_a, 1U)) {
+            tm_printf((UB *)"S4: CTRL_REG3_A read failed\n");
+        } else {
+            tm_printf((UB *)"S4: CTRL_REG3_A=0x%02X\n", ctrl3_a);
+        }
+
+        if (!i2c0_read_regs(GY511_ACCEL_I2C_ADDRESS,
+                            0x27U, &status_a, 1U)) {
+            tm_printf((UB *)"S4: STATUS_REG_A read failed\n");
+        } else {
+            tm_printf((UB *)"S4: STATUS_REG_A=0x%02X\n", status_a);
+        }
+
+        uint8_t status = 0U;
+        uint8_t xyz[6] = {0};
+
+        for (int i = 0; i < 5; i++) {
+            bool status_ok = i2c0_read_regs(
+                GY511_ACCEL_I2C_ADDRESS, 0x27U, &status, 1U);
+
+            bool xyz_ok = i2c0_read_regs(
+                GY511_ACCEL_I2C_ADDRESS, 0xA8U, xyz, 6U);
+
+            tm_printf((UB *)"S4: status_ok=%d status=%02X "
+                    "xyz_ok=%d xyz=%02X %02X %02X %02X %02X %02X\n",
+                    status_ok, status, xyz_ok,
+                    xyz[0], xyz[1], xyz[2],
+                    xyz[3], xyz[4], xyz[5]);
+
+            (void)tk_dly_tsk(20U);
+        }
+
         /* CTRL7 (0x26): Magnetometer continuous-conversion mode -> 0x00 */
         if (!i2c0_write_reg(GY511_ACCEL_I2C_ADDRESS, 0x26U, 0x00U)) {
             g_error_stage = 7U;
@@ -322,6 +411,8 @@ bool GY511_Init(void)
     } else {
         Subsystem4_Fault_Clear_Bits(SYS_FAULT_BIT_IMU_I2C);
     }
+
+    GY511_Diagnostic();
     return ok;
 }
 

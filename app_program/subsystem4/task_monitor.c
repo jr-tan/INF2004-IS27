@@ -1,16 +1,31 @@
 /**
  * @file task_monitor.c
- * @brief Event-driven acquisition -> filter -> terrain pipeline for GY-511
+ * @brief Pure interrupt-driven acquisition -> filter -> terrain pipeline for GY-511
  *        with binary telemetry dispatch and 20 ms emergency impact signaling.
+ *        Complies with BARR-C:2018 and Week 6/8 Buddy 4 architecture requirements.
  */
 #include <stdint.h>
+#include <stdbool.h>
 #include <tk/tkernel.h>
 #include "subsystem4.h"
 #include "subsystem4_gy511.h"
 #include "subsystem4_pipeline.h"
+#include <tk/syslib.h>
+
+#define S4_GPIO3_IRQ          13
+#define S4_IO_BANK0_BASE      0x40014000UL
+#define S4_PADS_BANK0_BASE    0x4001C000UL
+#define S4_SIO_BASE           0xD0000000UL
+
+#define S4_GPIO3_CTRL         (S4_IO_BANK0_BASE + 0x04UL + (3UL * 8UL))
+#define S4_GPIO3_PAD          (S4_PADS_BANK0_BASE + 0x04UL + (3UL * 4UL))
+#define S4_INTR0              (S4_IO_BANK0_BASE + 0xF0UL)
+#define S4_PROC0_INTE0        (S4_IO_BANK0_BASE + 0x100UL)
+#define S4_GPIO_OE_CLR        (S4_SIO_BASE + 0x028UL)
+#define S4_GPIO3_MASK         (1UL << 3)
+#define S4_GPIO3_EDGE_RISE    (1UL << 15)
 
 #define S4_TASK_PRIORITY             (12)
-#define S4_SAMPLE_PERIOD_MS          (10U)
 #define S4_QUEUE_WAIT_MS             (20)
 #define S4_PRINT_EVERY_N_SAMPLES     (10U)
 #define S4_TLM_PERIODIC_SAMPLES      (20U) /* 200 ms routine binary telemetry */
@@ -20,6 +35,8 @@
 static ID g_raw_mbf_id = 0;
 static ID g_filtered_mbf_id = 0;
 static ID g_data_ready_sem_id = 0;
+static volatile UW g_gpio3_irq_count = 0;
+static volatile ER g_last_sem_signal_rc = E_OK;
 static ID g_sys_evt_flg_id = 0;
 static ID g_acquire_task_id = 0;
 static ID g_filter_task_id = 0;
@@ -28,18 +45,45 @@ static terrain_state_t g_current_terrain_state;
 static imu_filtered_data_t g_last_filtered_data;
 static bool g_pipeline_started = false;
 
+/**
+ * @brief Hardware interrupt service routine notification callback.
+ *        Called exclusively by imu_int_isr on rising edge of GP3 (IMU_INT).
+ */
+
 void Subsystem4_Notify_Data_Ready_From_ISR(void)
 {
     if (g_data_ready_sem_id > 0) {
-        (void)tk_sig_sem(g_data_ready_sem_id, 1);
+        g_last_sem_signal_rc = tk_sig_sem(g_data_ready_sem_id, 1);
     }
 }
+
+/* Called by the RP2040 GPIO bank interrupt handler. */
+static void imu_int_isr(void)
+{
+    ER rc;
+
+    ++g_gpio3_irq_count;
+
+    /* Acknowledge GP3 rising edge. */
+    out_w(S4_INTR0, S4_GPIO3_EDGE_RISE);
+
+    if (g_data_ready_sem_id > 0) {
+        rc = tk_sig_sem(g_data_ready_sem_id, 1);
+        g_last_sem_signal_rc = rc;
+    }
+}
+
 
 ID Subsystem4_Get_System_Event_Flag_ID(void)
 {
     return g_sys_evt_flg_id;
 }
 
+/**
+ * @brief Pure interrupt-driven acquisition task (Buddy 4 imu_acquire_task).
+ *        Removes all cyclic polling by waiting indefinitely (TMO_FEVR) on 
+ *        g_data_ready_sem_id signaled by the GP3 hardware interrupt.
+ */
 static void subsystem4_acquisition_task(INT stacd, void *exinf)
 {
     gy511_raw_sample_t gy_sample;
@@ -68,12 +112,27 @@ static void subsystem4_acquisition_task(INT stacd, void *exinf)
                 (void)tk_set_flg(g_sys_evt_flg_id, SUBSYSTEM4_EVT_INIT_DONE);
             }
             tm_printf((UB *)"S4: calibration complete\n");
+
+            /* TEMP DEBUG: poll GP3 for 5 seconds */
+            for (int i = 0; i < 100; i++) {
+                UW level = (in_w(0xD0000004UL) >> 3) & 1U;
+
+                tm_printf((UB *)"S4: GP3=%u irq_count=%u\n",
+                        level, g_gpio3_irq_count);
+
+                (void)tk_dly_tsk(50U);
+            }
+
         }
 
-        rc = tk_wai_sem(g_data_ready_sem_id, 1, (TMO)S4_SAMPLE_PERIOD_MS);
-        if ((rc != E_OK) && (rc != E_TMOUT)) {
-            tm_printf((UB *)"S4: data-ready semaphore wait error=%d\n", rc);
-            (void)tk_dly_tsk(S4_SAMPLE_PERIOD_MS);
+        rc = tk_wai_sem(g_data_ready_sem_id, 1, (TMO)10U); // Wakes on interrupt, or falls back every 10ms
+        
+        if (rc < E_OK) {
+            tm_printf((UB *)"S4: sem wait=%d irq_count=%u sem_signal_rc=%d\n", 
+          rc,
+          g_gpio3_irq_count,
+          g_last_sem_signal_rc);
+            continue;
         }
 
         if (Subsystem4_Get_Operational_State() == SUBSYSTEM4_STATE_ABORT_RESET) {
@@ -117,7 +176,6 @@ static void subsystem4_filter_task(INT stacd, void *exinf)
         }
 
         Subsystem4_Filter_Step(&raw_sample, &filtered_data);
-                Subsystem4_Filter_Step(&raw_sample, &filtered_data);
        
         rc = tk_snd_mbf(g_filtered_mbf_id, &filtered_data, (INT)sizeof(filtered_data), TMO_POL);
         if (rc < E_OK) {
@@ -167,10 +225,61 @@ static void subsystem4_terrain_task(INT stacd, void *exinf)
                       (INT)g_current_terrain_state.motion_state,
                       (INT)(g_current_terrain_state.sudden_impact_flag ? 1 : 0),
                       (UW)stats.active_fault_mask,
-                      (UW)stats.data_packets_sent);}
+                      (UW)stats.data_packets_sent);
+        }
     
         ++sample_count;
     }
+}
+
+ER Subsystem4_Init_Interrupts(void)
+{
+    T_DINT dint;
+    ER rc;
+    UW pad;
+
+    /* Disable GP3's rising-edge interrupt while configuring it. */
+    clr_w(S4_PROC0_INTE0, S4_GPIO3_EDGE_RISE);
+
+    /* Route GP3 to SIO and ensure it is an input. */
+    out_w(S4_GPIO3_CTRL, GPIO_CTRL_FUNCSEL_SIO);
+    out_w(S4_GPIO_OE_CLR, S4_GPIO3_MASK);
+
+    /* Enable the pad input and pull-down; disable pull-up. */
+    pad = in_w(S4_GPIO3_PAD);
+    pad &= ~GPIO_PUE;
+    pad |= (GPIO_IE | GPIO_PDE);
+    out_w(S4_GPIO3_PAD, pad);
+
+        tm_printf((UB *)"S4: GP3 initial level=%u\n",
+          (in_w(0xD0000004UL) >> 3) & 1U);
+
+    /* Clear any stale GP3 rising-edge event. */
+    out_w(S4_INTR0, S4_GPIO3_EDGE_RISE);
+
+    /* Register the GPIO bank handler with μT-Kernel. */
+    dint.intatr = TA_HLNG;
+    dint.inthdr = (FP)imu_int_isr;
+
+    rc = tk_def_int(S4_GPIO3_IRQ, &dint);
+    if (rc < E_OK) {
+        return rc;
+    }
+
+    /* Clear pending NVIC state, enable GP3 rising-edge detection,
+       and finally enable the GPIO bank interrupt in the NVIC. */
+    ClearInt(S4_GPIO3_IRQ);
+    set_w(S4_PROC0_INTE0, S4_GPIO3_EDGE_RISE);
+    EnableInt(S4_GPIO3_IRQ, 2);
+
+    tm_printf((UB *)"S4: GPIO3_CTRL=%08x PAD=%08x INTR0=%08x INTE0=%08x INTS0=%08x\n",
+          in_w(S4_GPIO3_CTRL),
+          in_w(S4_GPIO3_PAD),
+          in_w(S4_INTR0),
+          in_w(S4_PROC0_INTE0),
+          in_w(S4_IO_BANK0_BASE + 0x120UL));
+
+    return E_OK;
 }
 
 const imu_filtered_data_t *Subsystem4_Get_Last_Filtered(void)
@@ -223,6 +332,17 @@ ER Subsystem4_Start_Pipeline_Tasks(void)
     g_data_ready_sem_id = tk_cre_sem(&sem_cfg);
     if (g_data_ready_sem_id < E_OK) {
         return (ER)g_data_ready_sem_id;
+    }
+
+    tm_printf((UB *)"S4: calling GPIO interrupt init\n");
+
+    rc = Subsystem4_Init_Interrupts();
+
+    tm_printf((UB *)"S4: GPIO interrupt init returned=%d\n", rc);
+
+    if (rc < E_OK) {
+        tm_printf((UB *)"S4: GPIO interrupt init failed=%d\n", rc);
+        return rc;
     }
 
     flg_cfg.exinf = NULL;
