@@ -416,9 +416,11 @@ LWIP_PORT_OBJS := ./mtkernel_3/lib/liblwip/sysdepend/pico_rp2040/sys_arch.o
 
 CYW43_LWIP_OBJS := ./mtkernel_3/cyw43/cyw43_lwip.o
 
+# comms_port.h (subsystem 1's bridge to the MQTT client) lives with the app code.
 LWIP_INCLUDES := -I"$(LIBLWIP_PORT)/include" \
                  -I"$(LIBLWIP_PORT)" \
-                 -I"$(LWIPDIR)/include"
+                 -I"$(LWIPDIR)/include" \
+                 -I"../app_program/subsystem1"
 
 CFLAGS += -DTM_NET_LWIP=1 $(LWIP_INCLUDES)
 

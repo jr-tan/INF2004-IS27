@@ -19,6 +19,12 @@
 #define MQTT_BROKER_IP   "192.168.1.10"
 #define MQTT_BROKER_PORT 1883
 #define MQTT_CLIENT_ID   "mtk3smp-pico"
-#define MQTT_TOPIC       "mtk3smp-pico/heartbeat"
+#define MQTT_TOPIC       "mtk3smp-pico/heartbeat"   /* unused since subsystem 1 (kept for old demos) */
+
+/* Optional: topic root for subsystem 1's binary topics (<root>/status, <root>/cmd,
+ * <root>/tlm/..., <root>/event/fault). Default "robot". Give each team a unique
+ * root if several robots share one broker, e.g. "robot/team27". The dashboard
+ * tool must use the same root (tools/comms_dashboard.py --root). */
+/* #define MQTT_TOPIC_ROOT  "robot" */
 
 #endif /* WIFI_SECRETS_H */

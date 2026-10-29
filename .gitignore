@@ -24,3 +24,6 @@ config/wifi_secrets.h
 
 # macOS
 .DS_Store
+__pycache__/
+*.pyc
+testing/subsystem1/host/test_codec
