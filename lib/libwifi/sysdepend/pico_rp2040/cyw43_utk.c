@@ -34,9 +34,12 @@
 
 /* An association can fail transiently -- a busy channel, a weak beacon, an AP
  * that drops the handshake under load. Without a retry the radio would sit in
- * CYW43_LINK_FAIL until the next power cycle, so re-issue the join on a fixed
+ * CYW43_LINK_FAIL until the next power cycle, so re-issue the join on a
  * backoff for as long as the link is down. */
-#define WIFI_REJOIN_DELAY_US (5 * 1000 * 1000ull)
+/* Backoff (NFR-B1-3): the delay before each re-join doubles 1 s, 2 s, 4 s, 8 s
+ * and is capped at 10 s; it restarts at 1 s once the link is up again. */
+#define WIFI_REJOIN_MIN_US (1 * 1000 * 1000ull)
+#define WIFI_REJOIN_MAX_US (10 * 1000 * 1000ull)
 
 /* Overridable from the makefile if an AP needs something else. MIXED accepts
  * both TKIP and AES; the driver treats it the same as WPA2_AES_PSK for a
@@ -82,6 +85,15 @@ static const char *link_status_str(int32_t status)
     default:                return "unknown";
     }
 }
+#endif
+
+/* BUDDY1 CHANGE: radio power-save.  The driver defaults to CYW43_PERFORMANCE_PM,
+ * which lets the chip sleep between beacons (~100 ms), so a frame published at an
+ * arbitrary moment can wait that long (measured ping RTT 140-200 ms).  NFR-B1-1
+ * needs state changes on the broker within 100 ms, so power-save is turned off.
+ * Build with -DWIFI_PM_MODE=CYW43_PERFORMANCE_PM to restore the driver default. */
+#ifndef WIFI_PM_MODE
+#define WIFI_PM_MODE         CYW43_NONE_PM
 #endif
 
 /* Off by default: it cost ~10s of every boot, flooded the console right before
@@ -236,6 +248,9 @@ void cyw43_utk_task(int32_t stacd, void *exinf)
         (void)cyw43_wifi_get_mac(&cyw43_state, CYW43_ITF_STA,
                                  radio_status.mac);
 #if TM_NET_LWIP
+        (void)cyw43_wifi_pm(&cyw43_state, WIFI_PM_MODE);
+#endif
+#if TM_NET_LWIP
         /* Join instead of scan: with lwIP wired in, the point of coming up
          * is a working network, not a diagnostic scan. cyw43_cb_tcpip_init()
          * already ran (from inside cyw43_wifi_set_up() above) and started
@@ -276,6 +291,7 @@ void cyw43_utk_task(int32_t stacd, void *exinf)
 #if TM_NET_LWIP
     int32_t  prev_link_status = radio_status.link_status;
     uint64_t rejoin_at = 0;
+    uint64_t rejoin_delay_us = WIFI_REJOIN_MIN_US;
 #endif
 
     for(;;) {
@@ -300,16 +316,33 @@ void cyw43_utk_task(int32_t stacd, void *exinf)
                           (int)radio_status.link_status);
             }
 
-            /* Negative == the association attempt is over and lost. Arm a
+            /* Down or negative == the association is over or lost. Arm a
              * retry; a positive-but-not-UP status (JOIN/NOIP) is still making
              * progress, so leave it alone and let DHCP finish. */
-            rejoin_at = (radio_status.link_status < 0)?
-                        time_us_64() + WIFI_REJOIN_DELAY_US: 0;
+            /* BUDDY1 CHANGE: a link that DROPS after having been up reports
+             * CYW43_LINK_DOWN (0), not a negative value, and the driver never
+             * re-joins by itself -- so "<= 0" (was "< 0") is needed for the
+             * robot to reconnect after an AP power-cycle (FR-B1-1). A join in
+             * progress reports JOIN (1), so 0 is never a "still working" state
+             * here: wifi_try_join() has already run before this loop. */
+            if(radio_status.link_status == CYW43_LINK_UP) {
+                rejoin_delay_us = WIFI_REJOIN_MIN_US;
+            }
+            if(radio_status.link_status <= 0) {
+                rejoin_at = time_us_64() + rejoin_delay_us;
+                tm_printf((UB*)"wifi: retry in %d s\n", (int)(rejoin_delay_us / 1000000ull));
+                rejoin_delay_us *= 2;
+                if(rejoin_delay_us > WIFI_REJOIN_MAX_US) {
+                    rejoin_delay_us = WIFI_REJOIN_MAX_US;
+                }
+            } else {
+                rejoin_at = 0;
+            }
         }
 
         if(rejoin_at != 0 && time_us_64() >= rejoin_at) {
             rejoin_at = 0;
-            if(radio_status.link_status < 0) {
+            if(radio_status.link_status <= 0) {
                 (void)wifi_try_join();
                 /* Force the next iteration to treat whatever comes back as a
                  * change, so the new outcome is always reported. Must be a
