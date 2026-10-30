@@ -1,48 +1,53 @@
 /*
  *	task_led.c
- *	Subsystem 1 -- the LED task and its cyclic handler.
+ *	Subsystem 1 -- comms status LED on GP19 (the Pico W's on-board LED is on
+ *	the radio chip and may not be driven from a student task).
  *
- *	APIs shown: tk_slp_tsk, tk_wup_tsk, tk_can_wup, cyclic handler,
- *	            gpio_set_pin / gpio_set_val
+ *	  solid on        MQTT session up, link healthy            (Operational)
+ *	  steady blink    connecting / reconnecting / link lost    (2 Hz)
+ *	  short flash     comms fault: no MQTT session for > 20 s  (1 tick in 4)
  *
- *	Instead of tk_dly_tsk(), this task sleeps until a cyclic handler
- *	wakes it.  The handler is called by the kernel's timer at a fixed
- *	rate, so the blink rate stays exact however long the task's own work
- *	takes.
+ *	Paced by a cyclic handler, as in the original template example.
  */
 
 #include "subsystem1.h"
 
-/*
- * Cyclic handler.  Runs in interrupt context, NOT as a task, so it must
- * be short and must never wait (no tk_slp_tsk, tk_wai_sem, tm_printf...).
- * Signalling a task is the normal thing to do here.
- */
+#define FAULT_PHASES	(4U)
+
 EXPORT void led_cyclic_handler(void *exinf)
 {
 	(void)exinf;
-	tk_wup_tsk(tid_led);	/* wake the LED task (the request queues
-				   up if the task is not asleep yet) */
+	tk_wup_tsk(tid_led);	/* wake the LED task (requests queue up) */
 }
 
 EXPORT void led_task(INT stacd, void *exinf)
 {
-	UINT	level = 0;
+	UINT	phase = 0U;
+	UINT	level = 0U;
 
 	(void)stacd; (void)exinf;
 
-	gpio_set_pin(S1_LED_PIN, GPIO_MODE_OUT);	/* make the pin an output */
+	gpio_set_pin(S1_LED_PIN, GPIO_MODE_OUT);
 
-	while (1) {
-		/* Sleep until led_cyclic_handler calls tk_wup_tsk() */
+	for (;;) {
+		T_RFLG	rflg;
+		UINT	ptn = 0U;
+
 		tk_slp_tsk(TMO_FEVR);
+		tk_can_wup(TSK_SELF);	/* do not "catch up" after being suspended */
 
-		/* tk_can_wup: discard wake-ups that queued up while we were
-		   not sleeping (e.g. while subsystem 4 had us suspended), so
-		   the LED does not "catch up" with a burst of fast blinks. */
-		tk_can_wup(TSK_SELF);
+		if (tk_ref_flg(flg_comms, &rflg) == E_OK) {
+			ptn = rflg.flgptn;
+		}
 
-		level = !level;
+		if ((ptn & CF_COMMS_FAULT) != 0U) {
+			phase = (phase + 1U) % FAULT_PHASES;
+			level = (phase == 0U) ? 1U : 0U;
+		} else if (((ptn & CF_MQTT_UP) != 0U) && ((ptn & CF_CONN_LOST) == 0U)) {
+			level = 1U;
+		} else {
+			level = (level == 0U) ? 1U : 0U;
+		}
 		gpio_set_val(S1_LED_PIN, level);
 	}
 }

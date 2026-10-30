@@ -17,7 +17,7 @@ subsystem, ask its owner or open a pull request for them to review.
 
 | # | Subsystem (what it does) | Student ID | GitHub username | Code | Tests |
 |---|---|---|---|---|---|
-| 1 | *example:* LED heartbeat on GP19 | | | `app_program/subsystem1/` | `testing/subsystem1/` |
+| 1 | WiFi, MQTT, telemetry, commands (Buddy 1) | 2500667 | | `app_program/subsystem1/` | `testing/subsystem1/` |
 | 2 | *example:* Producer: makes a sample every 300 ms | | | `app_program/subsystem2/` | `testing/subsystem2/` |
 | 3 | *example:* Consumer: collects samples into statistics | | | `app_program/subsystem3/` | `testing/subsystem3/` |
 | 4 | *example:* Monitor: prints reports, pauses the LED | | | `app_program/subsystem4/` | `testing/subsystem4/` |
@@ -67,7 +67,7 @@ fixed.
 | GP16 | | |
 | GP17 | | |
 | GP18 | | |
-| GP19 | *example:* S1 | external LED (LED + 330 Ω to GND) |
+| GP19 | S1 | comms status LED (LED + 330 Ω to GND) |
 | GP20 | | |
 | GP21 | | |
 | GP22 | | |
@@ -146,7 +146,7 @@ change it only by team agreement. Write down every task you create.
 
 | Subsystem | Priority band | Tasks (name – priority – core) |
 |---|---|---|
-| 1 | 12–13 | *example:* led_task – 12 – any |
+| 1 | 26–29 | cmd_dispatch_task – 26 – any; wifi_link_task – 27 – any; heartbeat_task – 28 – any; led_task – 29 – any |
 | 2 | 14–15 | *example:* producer_task – 14 – core 1 |
 | 3 | 16–17 | *example:* consumer_task – 16 – core 0 |
 | 4 | 18–19 | *example:* monitor_task – 18 – any |
@@ -167,7 +167,10 @@ sends to it or waits on it. Agree on the data format before coding.
 | IF-03 | S3 → S4 | message buffer + event flag (owned by S4) | `mbf_summary`, `flg_events` | text line ≤ `S4_SUMMARY_MAX` bytes, then `FLG_BATCH` | *example* |
 | IF-04 | S4 → S3 | shared data under a mutex (owned by S3) | `app_stats`, `mtx_stats` | `APP_STATS`, read only while locked | *example* |
 | IF-05 | S4 → S1 | task control | `tid_led` | `tk_sus_tsk` / `tk_rsm_tsk` / `tk_chg_pri` | *example* |
-| IF-06 | | | | | |
+| IF-06 | S2–S5 → S1 | function calls (non-blocking) | `comms_publish()`, `comms_is_up()` | binary frame on a topic; see `docs/buddy1_comms.md` | *proposed* |
+| IF-07 | S1 → mission ctrl | event flag | `flg_cmd` (`CMDF_START/STOP/PAUSE/RESUME`) | forwarded MQTT commands; temporary stand-in for `sys_evt_flg` | *proposed* |
+| IF-08 | all ↔ S1 | event flag + calls | `flg_fault`, `fault_raise/clear/get()` | shared fault bitmask (`FAULT_*` in `comms_frames.h`) | *proposed* |
+| IF-09 | mission ctrl → S1 | function call | `comms_set_mode()` | system mode 0–8; triggers a status frame | *proposed* |
 
 Each interface is tested by at least one integration test
 (`testing/integration/TEST_LOG.md`).
@@ -179,12 +182,12 @@ limit there. The numbers below are the example's usage.
 
 | Object | Limit | S1 | S2 | S3 | S4 | S5 |
 |---|---|---|---|---|---|---|
-| Task | 32 | 1 | 1 | 1 | 1 | |
+| Task | 32 | 4 | 1 | 1 | 1 | |
 | Semaphore | 16 | | 1 | | | |
-| Event flag | 16 | | | | 1 | |
+| Event flag | 16 | 3 | | | 1 | |
 | Mailbox | 12 | | | 1 | | |
 | Mutex | 12 | | | 1 | | |
-| Message buffer | 12 | | | | 1 | |
+| Message buffer | 12 | 2 | | | 1 | |
 | Fixed memory pool | 12 | | 1 | | | |
 | Variable memory pool | 12 | | | | | |
 | Cyclic handler | 12 | 1 | | | | |
