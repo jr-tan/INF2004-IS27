@@ -103,6 +103,12 @@ IMPORT BOOL line_inside(void);		/* TRUE: INSIDE or EDGE layout (both black is
 #define LINE_BEND_FLOOR		25	/* bend speed never below this: motors may stall */
 #define LINE_SPEED_MAX		300
 IMPORT void line_set_speed(INT mms);
+/* Climb mode (12 Nov evening): set by the mission on a slope / one-sided
+   ramp / stall.  Line following goes on, but at LINE_CLIMB_MMS and with
+   the steering capped so both wheels always drive forward. */
+#define LINE_CLIMB_MMS		70
+#define LINE_CLIMB_STEER	250	/* inner wheel >= 50 % of the outer one */
+IMPORT void line_climb(BOOL on);
 IMPORT INT  line_get_speed(void);
 /* Live tuning from the dashboard: speed (mm/s), bend speed in % of it,
    steering strength (KP x1000).  0 = leave that one unchanged. */
@@ -231,7 +237,8 @@ IMPORT BOOL motion_heading_ok(void);
 #define EV_CMD_RESUME		(1U << 9)
 #define EV_CMD_UTURN		(1U << 10)
 #define EV_CMD_REVERSE		(1U << 11)
-#define EV_ALL			0xFFFU
+#define EV_LIFT			(1U << 12)	/* IMU: lifted off the floor (picked up) */
+#define EV_ALL			0x1FFFU
 IMPORT void mission_event(UINT ev);
 
 #define MS_IDLE			0

@@ -41,6 +41,14 @@ LOCAL INT up_sign = IMU_UP_SIGN, left_sign = IMU_LEFT_SIGN;
 #define IMU_IMPACT_MG		1500	/* |a| - 1 g above this = impact */
 #define IMU_TILT_D10		350	/* 35 deg */
 #define IMU_TILT_MS		300
+/* picked up (12 Nov evening): lifting the car pushes the accelerometer
+   above 1 g for a while.  IMU_LIFT_HITS of the last IMU_LIFT_WIN raw
+   samples (20 ms each) more than IMU_LIFT_MG above 1 g -> EV_LIFT (the
+   mission safe-stops while driving).  A bump is a 1-sample spike, so it
+   does not count.  CAL: the console prints "IMU lift" with the value. */
+#define IMU_LIFT_MG		250
+#define IMU_LIFT_HITS		3
+#define IMU_LIFT_WIN		4
 #define IMU_EVENT_SHOW_MS	1000	/* event bits stay set this long (telemetry) */
 
 static const HUMP_TUNE hump_tune = {
@@ -295,6 +303,8 @@ LOCAL void imu_task(INT stacd, void *exinf)
 	INT fails = 0, n = 0;
 	UW tilt_t0 = 0, impact_t = 0, ev_t[3] = {0, 0, 0};
 	BOOL tilted = FALSE, have_level = FALSE;
+	UINT lift_hist = 0;
+	UW lift_t = 0;
 	W odo_last = 0;
 
 	(void)stacd; (void)exinf;
@@ -338,6 +348,20 @@ LOCAL void imu_task(INT stacd, void *exinf)
 			tm_printf((UB*)"IMU impact %d mg\n", st.shock_mg);
 		}
 		if (impact_t && (t - impact_t) > 3000U) { fault_clear(FAULT_IMPACT); impact_t = 0; }
+
+		/* picked up: sustained push above 1 g */
+		{
+			UINT k, h;
+			lift_hist = ((lift_hist << 1) | (mag_g - 1000 > IMU_LIFT_MG ? 1U : 0U)) &
+				    ((1U << IMU_LIFT_WIN) - 1U);
+			for (h = lift_hist, k = 0; h; h >>= 1) k += h & 1U;
+			if (k >= IMU_LIFT_HITS && n > IMU_SETTLE_SAMPLES && (t - lift_t) > 1000U) {
+				lift_t = t;
+				mission_event(EV_LIFT);
+				tm_printf((UB*)"IMU lift: %d mg above 1 g on %d of %d samples\n",
+					  mag_g - 1000, (INT)k, IMU_LIFT_WIN);
+			}
+		}
 
 		for (i = 0; i < 3; i++) f[i] += (a[i] - f[i]) / 4;	/* smoothing */
 		st.ax = f[0]; st.ay = f[1]; st.az = f[2];

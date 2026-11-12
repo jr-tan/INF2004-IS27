@@ -97,6 +97,10 @@ EXPORT void line_follow(BOOL on, INT side, BOOL deep)
 
 EXPORT void line_get(LINE_STATUS *st) { *st = ls; }	/* debug copy */
 EXPORT UINT line_see_bits(void) { return see_bits; }
+/* climb mode (mission, on a slope or when stalled): no pivoting, both
+   wheels always forward, a bit faster for momentum */
+LOCAL volatile BOOL climb_on;
+EXPORT void line_climb(BOOL on) { climb_on = on; }
 
 /* ---------------- ADC (direct registers) ---------------- */
 #define ADC_CS		(0x4004C000U + 0x00U)
@@ -218,6 +222,18 @@ LOCAL void line_task(INT stacd, void *exinf)
 				on = FALSE;			/* stop driving the slot */
 				motion_drive(MOT_OWNER_LINE, 0, 0);
 				mission_event(EV_LINE_LOST);
+			} else if (barcode_busy() && !climb_on) {
+				/* 12 Nov evening: bars passing under the barcode sensor:
+				   steady speed, gentle steering (no pivot / bend stop),
+				   so the zig-zag doesn't stretch a narrow bar into a
+				   wide one */
+				motion_drive(MOT_OWNER_LINE, speed_now,
+					     CLAMP(out.steer, -LINE_CLIMB_STEER, LINE_CLIMB_STEER));
+			} else if (climb_on) {
+				/* |steer| LINE_CLIMB_STEER keeps the inner wheel at
+				   (1 - 2 x steer/1000) of the outer one, never stopped */
+				motion_drive(MOT_OWNER_LINE, LINE_CLIMB_MMS,
+					     CLAMP(out.steer, -LINE_CLIMB_STEER, LINE_CLIMB_STEER));
 			} else {
 				motion_drive(MOT_OWNER_LINE, out.speed, out.steer);
 			}

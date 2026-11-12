@@ -23,11 +23,18 @@
 #define C39_ERR_UNKNOWN		(-3)	/* pattern is no Code 39 character */
 #define C39_ERR_FRAME		(-4)	/* no '*' at both ends */
 #define C39_ERR_SPACE		(-5)	/* output buffer too small */
+#define C39_ERR_FULLASCII	(-6)	/* $ % / + not followed by a valid letter */
 
 /* returns the text length (start/stop '*' removed) or a C39_ERR_* value.
    ratio_x10: least wide/narrow ratio x10 (e.g. 15 = 1.5) */
 int32_t code39_decode(const uint32_t *w, int32_t n, int32_t ratio_x10,
 		      char *out, int32_t cap, int32_t *reversed);
+
+/* Code 39 Full ASCII: turns the pairs $X %X /X +X of a decoded text into
+   the 128 ASCII characters (e.g. "+A" -> 'a', "/A" -> '!', "$A" -> 0x01).
+   Other characters are copied.  Returns the new length or C39_ERR_*.
+   in and out may be the same buffer (out is never longer than in). */
+int32_t code39_full_ascii(const char *in, char *out, int32_t cap);
 
 /* 9-element pattern of ch (bit 8 = first element, 1 = wide), or -1 */
 int32_t code39_pattern(char ch);

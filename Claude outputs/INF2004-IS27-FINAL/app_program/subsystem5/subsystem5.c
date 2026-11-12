@@ -113,6 +113,12 @@ LOCAL void ranger_task(INT stacd, void *exinf)
 	INT cur = 0;
 	UW settled_at = now_ms() + 500U;	/* servo power-up */
 	UINT seq = 0, hits = 0, stuck = 0, silent = 0;
+	BOOL moved = TRUE;		/* servo moved since the last ping */
+#if RANGE_BENCH_MS
+	INT  bench_cm[32];
+	UINT bench_n = 0, bench_all = 0;
+	UW   bench_t = now_ms();
+#endif
 
 	(void)stacd; (void)exinf;
 
@@ -143,6 +149,7 @@ LOCAL void ranger_task(INT stacd, void *exinf)
 		if (want != cur) {
 			settled_at = now_ms() + servo_set(want, cur);
 			cur = want;
+			moved = TRUE;
 		}
 		t = now_ms();
 		if ((W)(settled_at - t) > 0) {		/* still moving: wait, no ping */
@@ -187,6 +194,9 @@ LOCAL void ranger_task(INT stacd, void *exinf)
 			valid = cm >= US_MIN_CM;
 		}
 		valid = valid && (aim_req == cur);	/* not if a new aim arrived */
+		/* 12 Nov evening: the first ping after a servo move often
+		   measured the wobble, not the target: throw it away */
+		if (moved) { valid = FALSE; moved = FALSE; }
 
 		seq = (seq + 1U) & 0xFFU;
 		last_word = (UW)cm | ((UW)(cur + 128) << 8) | ((UW)seq << 16) |
@@ -207,6 +217,36 @@ LOCAL void ranger_task(INT stacd, void *exinf)
 		} else {
 			hits = 0;
 		}
+
+#if RANGE_BENCH_MS
+		/* bench test: parked (IDLE), sensor straight ahead */
+		if (mission_state() == MS_IDLE && cur == 0) {
+			bench_all++;
+			if (valid && cm < RANGE_FAR_CM && bench_n < 32U) bench_cm[bench_n++] = cm;
+			if ((now_ms() - bench_t) >= RANGE_BENCH_MS) {
+				LINE_STATUS l;
+				line_get(&l);
+				if (bench_n) {
+					UINT a, b;
+					for (a = 1; a < bench_n; a++)	/* insertion sort, n <= 32 */
+						for (b = a; b > 0 && bench_cm[b - 1] > bench_cm[b]; b--) {
+							INT x = bench_cm[b]; bench_cm[b] = bench_cm[b - 1]; bench_cm[b - 1] = x;
+						}
+					tm_printf((UB*)"RANGE bench: median %d cm, min %d, max %d, spread %d cm (%d of %d pings had an echo)"
+						  " | line raw L %d R %d\n",
+						  bench_cm[bench_n / 2], bench_cm[0], bench_cm[bench_n - 1],
+						  bench_cm[bench_n - 1] - bench_cm[0], (INT)bench_n, (INT)bench_all,
+						  (INT)l.raw[0], (INT)l.raw[1]);
+				} else {
+					tm_printf((UB*)"RANGE bench: no echo in %d pings (nothing within ~4 m, or sensor/power problem)"
+						  " | line raw L %d R %d\n", (INT)bench_all, (INT)l.raw[0], (INT)l.raw[1]);
+				}
+				bench_n = 0; bench_all = 0; bench_t = now_ms();
+			}
+		} else {
+			bench_n = 0; bench_all = 0; bench_t = now_ms();
+		}
+#endif
 
 		tk_dly_tsk(fast ? SWEEP_PING_PERIOD_MS - SWEEP_ECHO_WAIT_MS : PING_PERIOD_MS - ECHO_WAIT_MS);
 	}

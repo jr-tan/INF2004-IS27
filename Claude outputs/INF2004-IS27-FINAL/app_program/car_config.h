@@ -75,6 +75,14 @@
 /* Barcode + IMU */
 #define PIN_BARCODE		2	/* Grove 2, barcode sensor D0 (edges via gpio_irq) */
 #define BARCODE_BLACK_IS_HIGH	1	/* 0 if D0 reads LOW on black */
+/* DEMO DAY: what each letter does, one character per letter A..Z
+   (lower case letters act like upper case):
+     L = turn left at the next junction    R = turn right
+     U = U-turn                            S = stop (end of course)
+     - = just report it
+   e.g. A = left, B = right, C = U-turn, D = stop, rest report only: */
+#define BC_ACTION_MAP		"LRUS----------------------"
+/*                             ABCDEFGHIJKLMNOPQRSTUVWXYZ */
 #define PIN_IMU_INT		3	/* Grove 2, GY-511 INT1: claimed, IMU is polled */
 #define PIN_IMU_SDA		4	/* Grove 3, I2C0 SDA */
 #define PIN_IMU_SCL		5	/* Grove 3, I2C0 SCL */

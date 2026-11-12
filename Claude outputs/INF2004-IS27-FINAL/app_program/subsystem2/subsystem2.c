@@ -114,6 +114,8 @@ LOCAL void motion_task(INT stacd, void *exinf)
 	UINT hi = 0, n_hist = 0;
 	BOOL healthy[2] = {TRUE, TRUE};
 	UW heal_t0[2] = {0, 0};
+	INT boost[2] = {0, 0};		/* stall boost, pm (12 Nov evening) */
+	UW boost_max_t[2] = {0, 0};	/* when the boost reached STALL_BOOST_MAX_PM */
 	UW t_last = now_us();
 	UINT last_owner = MOT_OWNER_NONE;
 	ENC_SNAP es[2];
@@ -188,10 +190,30 @@ LOCAL void motion_task(INT stacd, void *exinf)
 			if (was == 0 && cur[m] != 0) start_us[m] = t;
 
 			sp = ABS(cur[m]);
-			if (sp < 5) { drv_motor_brake(m); duty[m] = 0; continue; }
+			if (was != 0 && cur[m] != 0 && (was > 0) != (cur[m] > 0)) boost[m] = 0;
+			if (sp < 5) { drv_motor_brake(m); duty[m] = 0; boost[m] = 0; continue; }
+
+			/* stall boost (12 Nov evening): a wheel that is driven but
+			   not turning (ramp, one-sided ramp, pivoting on one
+			   wheel at ~15 % duty) gets more duty, step by step,
+			   until it moves; the boost then fades out slowly */
+			if (healthy[m] && sp >= STALL_MIN_MMS &&
+			    (t - start_us[m]) > MOT_KICK_MS * 1000U &&
+			    (t - es[m].last_us) > STALL_MS * 1000U) {
+				if (boost[m] < STALL_BOOST_MAX_PM) {
+					boost[m] += STALL_BOOST_STEP_PM;
+					if (boost[m] >= STALL_BOOST_MAX_PM) {
+						boost[m] = STALL_BOOST_MAX_PM;
+						boost_max_t[m] = t;
+					}
+				}
+			} else if (boost[m] > 0) {
+				boost[m] -= STALL_BOOST_FADE_PM;
+				if (boost[m] < 0) boost[m] = 0;
+			}
 
 			d = ((MOT_D0_PM + (sp * MOT_K_PM_X1000) / 1000) * gain[m]) / 1000;
-			d += trim[m];
+			d += trim[m] + boost[m];
 			if ((t - start_us[m]) < MOT_KICK_MS * 1000U) d += MOT_KICK_PM;
 			/* trim learnt with the wheels in the air can be very
 			   negative: never let it push the duty below the level
@@ -201,17 +223,24 @@ LOCAL void motion_task(INT stacd, void *exinf)
 			drv_motor_set(m, cur[m] > 0 ? 1 : -1, duty[m]);
 		}
 
-		/* encoder health: driven but no steps for ENC_DEAD_MS */
+		/* encoder health: driven but no steps.  12 Nov evening: a
+		   silent wheel is first treated as STALLED (boost above); only
+		   if it is still silent STALL_GIVEUP_MS after the boost hit its
+		   maximum is the ENCODER declared dead.  Before, a wheel stuck
+		   on a ramp was called a dead encoder after 0.2 s, its trim was
+		   thrown away and the car never got going again. */
 		BOOL fresh[2];
 		for (m = 0; m < 2; m++) {
-			BOOL driven = ABS(cur[m]) >= ENC_MIN_MMS &&
+			BOOL driven = ABS(cur[m]) >= TRIM_MIN_MMS &&
 				      (t - start_us[m]) > (MOT_KICK_MS + ENC_DEAD_MS) * 1000U;
 			BOOL silent = (t - es[m].last_us) > ENC_DEAD_MS * 1000U;
 			fresh[m] = driven && !silent;
 			if (healthy[m]) {
-				if (driven && silent) {
+				if (driven && silent && boost[m] >= STALL_BOOST_MAX_PM &&
+				    (t - boost_max_t[m]) > STALL_GIVEUP_MS * 1000U) {
 					healthy[m] = FALSE;
 					trim[m] = 0;		/* learned from a dead wheel: forget it */
+					boost[m] = 0;
 				}
 				heal_t0[m] = t;
 			} else if (silent) {
@@ -221,17 +250,21 @@ LOCAL void motion_task(INT stacd, void *exinf)
 			}
 		}
 
-		/* hybrid trim: learn only while both encoders are believable */
-		trim_on = healthy[0] && healthy[1] && fresh[0] && fresh[1] &&
-			  n_hist == ENC_WINDOW_TICKS &&
-			  ABS(cur[0]) >= ENC_MIN_MMS && ABS(cur[1]) >= ENC_MIN_MMS &&
-			  ABS(cur[0] - tgt[0]) <= 20 && ABS(cur[1] - tgt[1]) <= 20 &&
-			  (cur[0] > 0) == (cur[1] > 0);	/* not while pivoting */
-		if (trim_on) {
+		/* speed control (trim), PER WHEEL.  12 Nov evening: it used
+		   to need both wheels above 40 mm/s and no pivoting, so at the
+		   line speed (25..30 mm/s, pivoting) it NEVER ran and the
+		   motors were pure open loop at ~15 % duty: any slope stalled
+		   them.  Now each wheel learns from TRIM_MIN_MMS up. */
+		trim_on = FALSE;
+		if (n_hist == ENC_WINDOW_TICKS) {
 			for (m = 0; m < 2; m++) {
-				INT err = ABS(cur[m]) - v[m];
+				INT err;
+				if (!healthy[m] || !fresh[m] || boost[m] != 0 ||
+				    ABS(cur[m]) < TRIM_MIN_MMS || ABS(cur[m] - tgt[m]) > 20) continue;
+				err = ABS(cur[m]) - v[m];
 				trim[m] += (err * TRIM_KI_X1000) / 1000;
 				trim[m] = CLAMP(trim[m], -TRIM_MAX_PM, TRIM_MAX_PM);
+				trim_on = TRUE;
 			}
 		}
 

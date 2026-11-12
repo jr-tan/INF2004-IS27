@@ -62,6 +62,48 @@ static int32_t decode_dir(const uint32_t *w, int32_t n, int32_t ratio_x10, char 
 	return len;
 }
 
+/* Full ASCII pairs (standard table) */
+static int32_t full_pair(char p, char l)
+{
+	if (l < 'A' || l > 'Z') return -1;
+	switch (p) {
+	case '+': return 'a' + (l - 'A');			/* +A..+Z  a..z */
+	case '$': return 0x01 + (l - 'A');			/* $A..$Z  ^A..^Z */
+	case '/':
+		if (l <= 'O') return '!' + (l - 'A');		/* /A../O  ! .. / */
+		if (l == 'Z') return ':';
+		return -1;
+	case '%':
+		if (l <= 'E') return 0x1B + (l - 'A');		/* ESC FS GS RS US */
+		if (l <= 'J') return ';' + (l - 'F');		/* ; < = > ? */
+		if (l <= 'O') return '[' + (l - 'K');		/* [ \ ] ^ _ */
+		if (l <= 'T') return '{' + (l - 'P');		/* { | } ~ DEL */
+		if (l == 'U') return 0x00;
+		if (l == 'V') return '@';
+		if (l == 'W') return '`';
+		return 0x7F;					/* %X %Y %Z */
+	default:  return -1;
+	}
+}
+
+int32_t code39_full_ascii(const char *in, char *out, int32_t cap)
+{
+	int32_t i = 0, len = 0, v;
+
+	while (in[i]) {
+		if (len >= cap - 1) return C39_ERR_SPACE;
+		if (in[i] == '$' || in[i] == '%' || in[i] == '/' || in[i] == '+') {
+			if ((v = full_pair(in[i], in[i + 1])) < 0) return C39_ERR_FULLASCII;
+			out[len++] = (char)v;
+			i += 2;
+		} else {
+			out[len++] = in[i++];
+		}
+	}
+	out[len] = '\0';
+	return len;
+}
+
 int32_t code39_decode(const uint32_t *w, int32_t n, int32_t ratio_x10,
 		      char *out, int32_t cap, int32_t *reversed)
 {

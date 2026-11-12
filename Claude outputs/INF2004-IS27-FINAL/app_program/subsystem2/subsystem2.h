@@ -39,15 +39,29 @@
    (where they touch the floor).  Turning heading = (right - left) / track.
    Check: turn the car one full circle on the spot by hand; the console
    "head" value should change by about 3600. */
-#define MOT_TRACK_MM		125
+#define MOT_TRACK_MM		108		/* measured 12 Nov (was 125: every encoder turn came out ~16 % too big) */
 #define ENC_WINDOW_TICKS	5		/* speed over 5 x 20 ms = 100 ms */
 #define ENC_DEAD_MS		200		/* driven, no steps this long = unhealthy */
 #define ENC_HEAL_MS		1000		/* steps again this long = healthy */
 #define ENC_MIN_MMS		40		/* below this the speed reading is too coarse */
 
-/* ---- encoder trim (the "hybrid" part) ---- */
+/* ---- encoder trim (the "hybrid" part): per-wheel speed control ---- */
 #define TRIM_KI_X1000		100		/* duty pm per (mm/s error) per tick, x1000 */
-#define TRIM_MAX_PM		150		/* never more than +-15 % duty */
+#define TRIM_MAX_PM		300		/* never more than +-30 % duty (was 15 %:
+						   not enough to hold speed up a slope) */
+#define TRIM_MIN_MMS		15		/* learns from this speed up (was 40) */
+
+/* ---- stall boost (12 Nov evening): driven, no encoder steps for
+   STALL_MS -> add STALL_BOOST_STEP_PM per 20 ms tick, up to
+   STALL_BOOST_MAX_PM; fades by STALL_BOOST_FADE_PM per tick once the
+   wheel turns.  Still no steps STALL_GIVEUP_MS after reaching the
+   maximum = the ENCODER is dead, not the wheel stuck. ---- */
+#define STALL_MIN_MMS		15
+#define STALL_MS		150
+#define STALL_BOOST_STEP_PM	15		/* 0 -> max in ~0.5 s */
+#define STALL_BOOST_MAX_PM	350
+#define STALL_BOOST_FADE_PM	5		/* max -> 0 in ~1.4 s */
+#define STALL_GIVEUP_MS		600
 
 /* ---- motion_flg bits ---- */
 #define MF_TICK			(1U << 0)	/* from the 20 ms cyclic handler */

@@ -33,8 +33,12 @@
    400 / 2500 never limited anything.  At 30 mm/s a 9 mm wide bar takes
    300 ms and a 141 mm barcode ~4.7 s, so the old values would now
    reject every barcode. */
-#define BC_MAX_EL_MS		600
-#define BC_MAX_FRAME_MS		7000
+/* 12 Nov evening: the course barcodes go up to ~333 mm long with
+   21 mm wide bars (BARCODE.pptx, largest size).  At 25 mm/s that is a
+   856 ms bar and a 13.3 s barcode, so 600 / 7000 rejected them.  The
+   sensor sits BESIDE the line, so it never sees the main line itself. */
+#define BC_MAX_EL_MS		1500
+#define BC_MAX_FRAME_MS		16000
 #define BC_RATIO_X10		15	/* wide must be >= 1.5 x narrow */
 #define BC_BUSY_HOLD_MS		400	/* "busy" this long after the last edge */
 
@@ -67,16 +71,22 @@ LOCAL void bc_isr(UINT gpio, UINT events, UW t)
 	if (bc_tid > 0) tk_wup_tsk(bc_tid);
 }
 
+/* letter -> action from BC_ACTION_MAP (car_config.h, set on demo day) */
 LOCAL UINT action_of(char c)
 {
-	switch (c) {
-	case 'A': return BC_ACT_LEFT;
-	case 'B': return BC_ACT_RIGHT;
-	case 'C': return BC_ACT_UTURN;
-	case 'D': return BC_ACT_END;
+	static const char map[] = BC_ACTION_MAP;
+	if (c >= 'a' && c <= 'z') c = (char)(c - 'a' + 'A');
+	if (c < 'A' || c > 'Z' || (UINT)(c - 'A') >= sizeof map - 1U) return BC_ACT_NONE;
+	switch (map[c - 'A']) {
+	case 'L': return BC_ACT_LEFT;
+	case 'R': return BC_ACT_RIGHT;
+	case 'U': return BC_ACT_UTURN;
+	case 'S': return BC_ACT_END;
 	default:  return BC_ACT_NONE;
 	}
 }
+LOCAL const char *const act_name[] = { "report only", "LEFT at the next junction",
+	"RIGHT at the next junction", "U-TURN", "STOP (end of course)" };
 
 LOCAL const char *err_text(INT e)
 {
@@ -85,6 +95,7 @@ LOCAL const char *err_text(INT e)
 	case C39_ERR_RATIO:   return "wide/narrow unclear";
 	case C39_ERR_UNKNOWN: return "unknown pattern";
 	case C39_ERR_FRAME:   return "no * start/stop";
+	case C39_ERR_FULLASCII: return "bad Full ASCII pair";
 	default:              return "too long";
 	}
 }
@@ -162,6 +173,7 @@ LOCAL void barcode_task(INT stacd, void *exinf)
 			for (i = 0; i < n - 1; i++) wid[i] = et[i + 1] - et[i];
 			r = broken ? C39_ERR_LENGTH
 				   : code39_decode(wid, n - 1, BC_RATIO_X10, txt, sizeof txt, &rev);
+			if (r > 0) r = code39_full_ascii(txt, txt, sizeof txt);	/* Full ASCII */
 			if (r > 0) {
 				for (i = 0; i <= r; i++) info.text[i] = txt[i];
 				info.action = action_of(txt[0]);
@@ -169,12 +181,18 @@ LOCAL void barcode_task(INT stacd, void *exinf)
 				info.t_ms = now;
 				info.good++;
 				info.seq++;
-				tm_printf((UB*)"BARCODE \"%s\"%s -> action %d\n", txt,
-					  rev ? " (read backwards)" : "", info.action);
+				tm_printf((UB*)"BARCODE \"%s\"%s -> %s\n", txt,
+					  rev ? " (read backwards)" : "", act_name[info.action]);
 				mission_event(EV_BARCODE);
 			} else if (n - 1 >= 9) {		/* ignore single specks */
 				info.bad++;
-				tm_printf((UB*)"BARCODE not read: %s (%d elements)\n", err_text(r), n - 1);
+				tm_printf((UB*)"BARCODE not read: %s (%d elements, need 29 for one letter)%s\n",
+					  err_text(r), n - 1, broken ? " [an edge was missed]" : "");
+				/* every bar / space in ms, to see what went wrong:
+				   wide ones should be ~3 x the narrow ones */
+				tm_printf((UB*)"BARCODE widths ms (bar space bar ...):");
+				for (i = 0; i < n - 1 && i < 60; i++) tm_printf((UB*)" %d", (INT)(wid[i] / 1000U));
+				tm_printf((UB*)"\n");
 			}
 		}
 	}
