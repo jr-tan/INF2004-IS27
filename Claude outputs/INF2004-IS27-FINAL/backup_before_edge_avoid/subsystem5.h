@@ -1,0 +1,132 @@
+/*
+ *	subsystem5.h  (Buddy 5: ultrasonic, servo, obstacle avoidance)
+ *	Public API in car.h.  Tunables here.
+ */
+#ifndef SUBSYSTEM5_H
+#define SUBSYSTEM5_H
+
+#include "../car.h"
+
+/* ---- ultrasonic ---- */
+#define US_PER_CM		58	/* round trip, speed of sound */
+#define US_MIN_CM		2	/* closer readings are glitches */
+
+/* ---- guard while line following ---- */
+#define GUARD_STOP_CM		25	/* obstacle closer than this ... */
+#define GUARD_HITS		3	/* ... on this many pings in a row (180 ms) */
+
+/* ---- servo (SG90 on GP13) ---- */
+#define SERVO_CENTER_US		1500
+#define SERVO_US_PER_DEG	11	/* ~1000 us per 90 deg */
+#define SERVO_REVERSE		0	/* 1 if + angle turns the sensor RIGHT */
+#define SERVO_MAX_DEG		25	/* never turn further than this (team choice) */
+#define SERVO_TEST_DEG		25	/* power-up self-test swing */
+#define SERVO_SETTLE_MS		30	/* per 15 deg moved (SG90: ~25 ms per 15 deg unloaded) */
+#define SERVO_SETTLE_MIN_MS	30	/* even a small move waits this long */
+
+/* ---- sweep mode (ranger_fast): the sweep only needs AV_FAR_CM, so the
+   echo window can be short and pings closer together.  10 ms of echo
+   = 172 cm.  Tick-sized (10 ms) values only. */
+#define SWEEP_ECHO_WAIT_MS	10
+#define SWEEP_PING_PERIOD_MS	30
+
+/* ---- avoidance (mission.c).  All CAL on the real track. ---- */
+#define AV_CONFIRM_MS		100	/* let the car stop rolling (the servo is already
+				   swinging to the first angle meanwhile), then
+				   sweep.  No separate re-check: the guard saw it
+				   3 times, and the sweep's middle readings say
+				   if it has gone. */
+#define AV_IDLE_MAX_MS		2000	/* the fan sweep starts no later than this
+				   after the stop, however patchy the echoes */
+#define AV_CLEAR_CM		35	/* front farther than this = clear (> GUARD_STOP_CM,
+				   or a car stopped at 26 cm would call it a false alarm) */
+/* fan sweep: ONE pass +24 -> -24 in 8 deg steps, 7 points (the servo
+   moves 8 deg at a time, never back and forth).  AV_SWEEP_MAX_DEG must
+   be a multiple of AV_SWEEP_STEP_DEG. */
+#define AV_SWEEP_MAX_DEG	24
+#define AV_SWEEP_STEP_DEG	8
+#define AV_SWEEP_PTS		(2 * AV_SWEEP_MAX_DEG / AV_SWEEP_STEP_DEG + 1)
+#define AV_PT_TIMEOUT_MS	200	/* no echo at an angle this long = free (255) */
+#define AV_PINGS_PER_PT		3	/* 12 Nov: readings per angle, closest kept */
+#define AV_BAND_CM		20	/* same obstacle if within closest + this */
+#define AV_FAR_CM		100	/* farther = free space */
+#define AV_BEAM_DEG		0	/* sound cone makes edges look wider: pull in.
+				   12 Nov: was 8, as large as the 8 deg sweep step, so
+				   a box seen at two angles shrank to 2 cm wide
+				   (18:48 run).  0 = never smaller than seen. */
+#define AV_HALF_CAR_CM		9	/* half the car's width: MEASURE */
+#define AV_MARGIN_CM		5	/* extra room when passing */
+#define AV_PREFER_LEFT		1	/* tie -> go round on the left */
+/* ---- going round: turns measured by the wheel encoders (heading),
+   distances by odometry.  Route, for an obstacle needing a sideways
+   move N (from the sweep), going round on side d:
+     OUT    turn AV_TURN_DEG toward d
+     WIDEN  drive N / sin(AV_TURN_DEG): now N to the side of the line
+     ALIGN  turn back: parallel to the line
+     PASS   drive past the obstacle (its distance + depth + car length)
+     BACK   turn AV_TURN_DEG toward the line
+     SEEK   drive until a line sensor sees black
+     ADVANCE drive AV_SENSOR_FWD_CM more: the wheels are now on the line
+     REJOIN turn back to the heading we had when we stopped, FOLLOW
+   Facing the same way as before the obstacle is what stops the car
+   from going round in circles or following the line backwards. */
+#define AV_TURN_DEG		45	/* CAL: angle of the side legs */
+#define AV_SPIN_MMS		80	/* wheel speed for spins in place */
+#define AV_SPIN_LEAD_D10	40	/* stop spinning this early (0.1 deg): the
+				   wheels coast a little after the brake */
+#define AV_DRIVE_MMS		80	/* speed on every straight leg */
+#define AV_SPIN_DPS		75	/* CAL: deg per second at AV_SPIN_MMS, only
+				   used if an encoder fails (timed turns) */
+#define AV_OBS_DEPTH_CM		20	/* CAL: assumed front-to-back size of an obstacle */
+#define AV_CAR_LEN_CM		20	/* CAL: car length, MEASURE */
+#define AV_SENSOR_FWD_CM	6	/* CAL: line sensors ahead of the wheel axle, MEASURE */
+#define AV_SEEK_EXTRA_CM	15	/* look this far beyond where the line should be */
+#define AV_FIND_DEG		35	/* back facing along the line but no sensor on it:
+				   sweep this far each way to find it */
+#define AV_FIND_MMS		50	/* slow spin while sweeping */
+#define AV_SIDE_DEG		25	/* servo angle while passing (toward obstacle) */
+/* With a narrow sweep most obstacles reach past the edge of the view.
+   Then the car can't measure the width: it goes round on the side with
+   more room at the sweep's ends, moving this far sideways. */
+#define AV_UNKNOWN_NEED_CM	35
+#define AV_SIDE_SEE_CM		30	/* side reading below this = obstacle still beside us */
+#define AV_PASS_MORE_CM		20	/* still beside us at the end of PASS: up to this much more */
+#define AV_SEEK_MMS		70	/* drive back toward the line */
+#define AV_SEEK_STOP_CM		12	/* on the way back: something this close -> stop */
+#define AV_BLOCKED_RETRY_MS	500	/* both sides blocked: sweep again after this */
+#define AV_BLOCKED_SWEEPS	2	/* blocked this many sweeps in a row: go round anyway */
+#define AV_RECHECK_PINGS	8	/* sweep said clear: this many clear pings IN A ROW
+				   ahead to believe it.  The 18:04 run (v3_23) got 3
+				   misses in a row with the box at 19 cm. */
+#define AV_RECHECK_MAX_MS	1200	/* no answer in this long: assume it is still there */
+#define AV_BACKWARD_DEG		90	/* after an obstacle, facing this far off the old
+				   heading = following the line backwards.
+				   12 Nov 18:48 run: was 120, the recovery spin had
+				   already turned the car ~120 deg before it fired.
+				   Too low and a real bend right after the obstacle
+				   trips it: raise again if that happens. */
+#define AV_BACKWARD_CHECK_MM	500	/* ... checked for this far after rejoining */
+#define AV_BACKWARD_TRIES	2	/* turned back this many times: give up (fault) */
+/* 12 Nov 18:48 run: the guard stopped the car at 10 cm.  That close the
+   +-24 deg sweep missed the obstacle, it was called "gone", and there
+   was no room to turn out.  Stopped closer than AV_BACKUP_BELOW_CM ->
+   reverse straight back to about AV_BACKUP_TO_CM first, then sweep. */
+#define AV_BACKUP_BELOW_CM	15
+#define AV_BACKUP_TO_CM		22
+#define AV_BACKUP_MMS		60
+#define AV_BACKUP_MAX_MS	2000	/* give up reversing after this (wheels stuck) */
+#define AV_BACKUP_SETTLE_MS	150	/* stop rolling before the sweep */
+CC_ASSERT(AV_BACKUP_TO_CM > AV_BACKUP_BELOW_CM, "AV_BACKUP_TO_CM must be above AV_BACKUP_BELOW_CM");
+
+CC_ASSERT(AV_IDLE_MAX_MS > AV_CONFIRM_MS + 3 * PING_PERIOD_MS, "AV_IDLE_MAX_MS too short for 3 pings");
+CC_ASSERT(SWEEP_ECHO_WAIT_MS * 1000 / US_PER_CM > AV_FAR_CM + 20, "sweep echo window too short for AV_FAR_CM");
+CC_ASSERT(SWEEP_ECHO_WAIT_MS < SWEEP_PING_PERIOD_MS, "sweep ping timing");
+CC_ASSERT(AV_CLEAR_CM >= GUARD_STOP_CM + 5, "AV_CLEAR_CM must be well above GUARD_STOP_CM");
+CC_ASSERT(AV_SWEEP_MAX_DEG % AV_SWEEP_STEP_DEG == 0,
+	  "AV_SWEEP_MAX_DEG must be a multiple of AV_SWEEP_STEP_DEG");
+CC_ASSERT(AV_SWEEP_MAX_DEG <= SERVO_MAX_DEG && AV_SIDE_DEG <= SERVO_MAX_DEG,
+	  "sweep / side angle beyond SERVO_MAX_DEG");
+
+IMPORT void ranger_led(BOOL on);	/* alert LED on GP14 */
+
+#endif

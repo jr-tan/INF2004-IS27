@@ -1,0 +1,180 @@
+diff --git a/app_program/subsystem1/comms_frames.c b/app_program/subsystem1/comms_frames.c
+index b10b280..cb00dda 100644
+--- a/app_program/subsystem1/comms_frames.c
++++ b/app_program/subsystem1/comms_frames.c
+@@ -66,7 +66,8 @@ uint32_t fr_motion(uint8_t *b, uint32_t t_ms, int32_t vl, int32_t vr,
+ 	bits_put(b, 27, 11, sat_s(vr, 11));
+ 	bits_put(b, 38, 14, sat_u(dist_cm, 14));
+ 	bits_put(b, 52, 2, owner & 3U);
+-	bits_put(b, 54, 1, enc_ok ? 1U : 0U);
++	bits_put(b, 54, 1, enc_ok & 1U);		/* left encoder healthy */
++	bits_put(b, 55, 1, (enc_ok >> 1) & 1U);	/* right encoder healthy (was a spare bit) */
+ 	return FR_MOTION_BYTES;
+ }
+ 
+diff --git a/app_program/subsystem1/comms_frames.h b/app_program/subsystem1/comms_frames.h
+index 0d643d7..133e89e 100644
+--- a/app_program/subsystem1/comms_frames.h
++++ b/app_program/subsystem1/comms_frames.h
+@@ -15,7 +15,7 @@
+  *	robot/event/fault  t ms 16, raised faults 12, pad 4                  4
+  *	robot/cmd (in)     code 3, id 5                                      1
+  *	robot/tlm/motion   t 16, vl s11 (mm/s), vr s11, dist 14 (cm),
+- *	                   owner 2, enc_ok 1                                 7
++ *	                   owner 2, enc L ok 1, enc R ok 1                   7
+  *	robot/tlm/line     t 16, mode 3, pos s8 (/8), see 2, barcode char 6,
+  *	                   barcode action 3, set speed 8 (cm/s), bend % 7,
+  *	                   steering KP/100 5, bend stop + pivot on 1         8
+@@ -69,6 +69,8 @@ uint32_t fr_status(uint8_t *b, uint32_t seq, uint32_t up_s, uint32_t rssi_neg,
+ uint32_t fr_fault(uint8_t *b, uint32_t t_ms, uint32_t raised);
+ uint32_t fr_motion(uint8_t *b, uint32_t t_ms, int32_t vl, int32_t vr,
+ 		   int32_t dist_cm, uint32_t owner, uint32_t enc_ok);
++/* enc_ok: bit 0 = left encoder healthy, bit 1 = right (12 Nov: was one
++   bit for both, so a fault didn't say which wheel) */
+ uint32_t fr_line(uint8_t *b, uint32_t t_ms, uint32_t mode, int32_t pos,
+ 		 uint32_t see, char bc_char, uint32_t bc_action, int32_t speed_mms,
+ 		 int32_t bend_pct, int32_t kp_x1000, uint32_t pivot);
+diff --git a/app_program/subsystem1/subsystem1.c b/app_program/subsystem1/subsystem1.c
+index a4b16cd..c8e8fd0 100644
+--- a/app_program/subsystem1/subsystem1.c
++++ b/app_program/subsystem1/subsystem1.c
+@@ -80,7 +80,7 @@ LOCAL void send_telemetry(void)
+ 
+ 	motion_get_status(&m);
+ 	fr_motion(f, t, m.tgt_mms[0], m.tgt_mms[1], motion_odometry_mm() / 10,
+-		  m.owner, m.healthy[0] && m.healthy[1]);
++		  m.owner, (m.healthy[0] ? 1U : 0U) | (m.healthy[1] ? 2U : 0U));
+ 	publish(COMMS_TOPIC_TLM_MOTION, f, FR_MOTION_BYTES);
+ 
+ 	line_get(&l);
+diff --git a/testing/comms_test/frames_dump.c b/testing/comms_test/frames_dump.c
+index f0a2771..b58dcd5 100644
+--- a/testing/comms_test/frames_dump.c
++++ b/testing/comms_test/frames_dump.c
+@@ -18,7 +18,7 @@ int main(void)
+ 	uint8_t b[16];
+ 	dump("status",   b, fr_status(b, 7, 123456, 0, SYS_AVOID, 0x203, 1));
+ 	dump("fault",    b, fr_fault(b, 70000, 0x088));
+-	dump("motion",   b, fr_motion(b, 1234, -110, 115, 532, 2, 1));
++	dump("motion",   b, fr_motion(b, 1234, -110, 115, 532, 2, 3));
+ 	dump("line",     b, fr_line(b, 999, 7, -517, 1, 'B', 2, 80, 45, 1800, 1));
+ 	{
+ 		uint8_t sp[5] = { 0, 12, 40, 18, 2 };
+diff --git a/testing/comms_test/test_frames.py b/testing/comms_test/test_frames.py
+index b5e676a..4a1fb5d 100644
+--- a/testing/comms_test/test_frames.py
++++ b/testing/comms_test/test_frames.py
+@@ -13,7 +13,8 @@ fr = {k: bytes.fromhex(v) for k, v in rows if k != "speedcmd"}
+ want = {
+     "status":   (c.decode_status,   {"seq": 7, "up_s": 123456, "mode": "AVOID", "faults": 0x203, "tx_drop": True}),
+     "fault":    (c.decode_fault,    {"t_ms": 70000 & 0xFFFF, "raised": 0x088}),
+-    "motion":   (c.decode_motion,   {"t_ms": 1234, "vl": -110, "vr": 115, "dist_cm": 532, "owner": "MISSION", "enc_ok": 1}),
++    "motion":   (c.decode_motion,   {"t_ms": 1234, "vl": -110, "vr": 115, "dist_cm": 532, "owner": "MISSION", "enc_ok": 1,
++                                     "enc_l": 1, "enc_r": 1}),
+     "line":     (c.decode_line,     {"t_ms": 999, "mode": "pivot", "pos": -64 * 8, "see": 1, "bc_char": "B", "bc_action": "RIGHT", "speed_mms": 80,
+                                      "bend_pct": 45, "kp": 1800, "pivot": 1}),
+     "terrain":  (c.decode_terrain,  {"t_ms": 4321, "pitch_d10": -73, "roll_d10": 125, "hump_mm": 23, "heading": 271, "events": 5}),
+diff --git a/tools/comms/comms_codec.py b/tools/comms/comms_codec.py
+index 185d3c5..fc3aac2 100644
+--- a/tools/comms/comms_codec.py
++++ b/tools/comms/comms_codec.py
+@@ -66,8 +66,9 @@ def decode_fault(frame):
+ def decode_motion(frame):
+     _check(frame, "motion")
+     f = _fields(frame, [("t_ms", 16, 0), ("vl", 11, 1), ("vr", 11, 1), ("dist_cm", 14, 0),
+-                        ("owner", 2, 0), ("enc_ok", 1, 0)])
++                        ("owner", 2, 0), ("enc_l", 1, 0), ("enc_r", 1, 0)])
+     f["owner"] = OWNERS[f["owner"]]
++    f["enc_ok"] = 1 if (f["enc_l"] and f["enc_r"]) else 0
+     return f
+ 
+ 
+@@ -110,7 +111,7 @@ def decode_resources(frame):
+ SPECS = {
+     "status":   [("seq", 4, 0), ("up_s", 20, 0), ("rssi", 7, 0), ("mode", 4, 0), ("faults", 12, 0), ("tx_drop", 1, 0)],
+     "fault":    [("t_ms", 16, 0), ("raised", 12, 0), ("pad", 4, 0)],
+-    "motion":   [("t_ms", 16, 0), ("vl", 11, 1), ("vr", 11, 1), ("dist_cm", 14, 0), ("owner", 2, 0), ("enc_ok", 1, 0)],
++    "motion":   [("t_ms", 16, 0), ("vl", 11, 1), ("vr", 11, 1), ("dist_cm", 14, 0), ("owner", 2, 0), ("enc_l", 1, 0), ("enc_r", 1, 0)],
+     "line":     [("t_ms", 16, 0), ("mode", 3, 0), ("pos8", 8, 1), ("see", 2, 0), ("bc_char", 6, 0), ("bc_action", 3, 0),
+                  ("speed_cs", 8, 0), ("bend_pct", 7, 0), ("kp100", 5, 0), ("pivot", 1, 0)],
+     "terrain":  [("t_ms", 16, 0), ("pitch_d10", 10, 1), ("roll_d10", 10, 1), ("hump_mm", 8, 0), ("heading", 9, 0), ("events", 3, 0)],
+diff --git a/tools/comms/is27_gui.py b/tools/comms/is27_gui.py
+index d356a74..53d3b49 100644
+--- a/tools/comms/is27_gui.py
++++ b/tools/comms/is27_gui.py
+@@ -83,6 +83,14 @@ class Dataset:
+                             ".%03d" % int((r["t"] % 1) * 1000)] + [r.get(c, "") for c in self.columns])
+ 
+ 
++def enc_text(d):
++    """which wheel encoder is unhealthy (motion frame bits enc_l / enc_r)"""
++    if d.get("enc_ok"):
++        return "ok"
++    l, r = d.get("enc_l", 0), d.get("enc_r", 0)
++    return "LEFT FAULT" if (r and not l) else "RIGHT FAULT" if (l and not r) else "BOTH FAULT"
++
++
+ def fmt_time(t):
+     return time.strftime("%H:%M:%S", time.localtime(t))
+ 
+@@ -675,7 +683,7 @@ class App:
+             self.event("FAULT raised %s" % ",".join(d["raised_names"]))
+         elif sub == "tlm/motion":
+             self.ds["motion"].add({"t": t, "vl": d["vl"], "vr": d["vr"], "dist_cm": d["dist_cm"],
+-                                   "owner": d["owner"], "enc_ok": "ok" if d["enc_ok"] else "FAULT"})
++                                   "owner": d["owner"], "enc_ok": enc_text(d)})
+         elif sub == "tlm/line":
+             see = ("L" if d["see"] & 1 else "") + ("R" if d["see"] & 2 else "")
+             self.ds["line"].add({"t": t, "mode": d["mode"], "pos": d["pos"], "sensors": see or "-",
+@@ -764,7 +772,7 @@ class App:
+             d = m[1]
+             val("speed", "%d / %d mm/s" % (d["vl"], d["vr"]))
+             val("dist", "%.2f m" % (d["dist_cm"] / 100))
+-            val("owner", "%s%s" % (d["owner"], "" if d["enc_ok"] else ", encoder fault"))
++            val("owner", "%s%s" % (d["owner"], "" if d["enc_ok"] else ", encoder " + enc_text(d)))
+         ln = self.last.get("tlm/line")
+         if ln:
+             d = ln[1]
+@@ -952,7 +960,7 @@ class DemoCar(threading.Thread):
+             hump_ev = 1 if 12.4 < ph < 13.4 and moving else 0
+             faults = 0x002 if 40 < (t % 60) < 44 else 0
+             self.put("tlm/motion", encode("motion", t_ms=ms, vl=vl, vr=vr, dist_cm=dist, owner=1 if moving else 0,
+-                                          enc_ok=0 if faults else 1))
++                                          enc_l=0 if faults else 1, enc_r=1))
+             self.put("tlm/line", encode("line", t_ms=ms, mode=mode if moving else 0, pos8=pos // 8,
+                                         see=(1 if pos < -150 else 0) | (2 if pos > 150 else 0),
+                                         bc_char=bc_char - 31 if bc_char else 0, bc_action=bc_act,
+diff --git a/app_program/subsystem2/subsystem2.c b/app_program/subsystem2/subsystem2.c
+index a8b9534..d578a49 100644
+--- a/app_program/subsystem2/subsystem2.c
++++ b/app_program/subsystem2/subsystem2.c
+@@ -243,16 +243,25 @@ LOCAL void motion_task(INT stacd, void *exinf)
+ 			if (first) { d0 = d1 = 0; first = FALSE; }
+ 			prev_pos[0] = es[0].pos;
+ 			prev_pos[1] = es[1].pos;
+-			if (healthy[0] && healthy[1]) step_um = ((d0 + d1) * ENC_UM_PER_STEP) / 2;
+-			else if (healthy[0])          step_um = d0 * ENC_UM_PER_STEP;
+-			else if (healthy[1])          step_um = d1 * ENC_UM_PER_STEP;
++			/* 12 Nov: one encoder unhealthy (dropping out): estimate its
++			   travel from the healthy wheel and the commanded speed ratio
++			   (spin in place: -1, straight: +1) instead of giving up on
++			   the heading.  Without this every obstacle turn fell back
++			   to timing, and the car swung far too wide. */
++			if (healthy[0] != healthy[1]) {
++				UINT g = healthy[0] ? 0U : 1U;	/* the good wheel */
++				W dg = g ? d1 : d0;
++				W est = cur[g] ? (W)((dg * cur[g ^ 1U]) / cur[g]) : 0;
++				if (g) d0 = est; else d1 = est;
++			}
++			if (healthy[0] || healthy[1]) step_um = ((d0 + d1) * ENC_UM_PER_STEP) / 2;
+ 			else step_um = (W)(((cur[0] + cur[1]) / 2) * (INT)(dt_us / 1000U));
+ 			odo_um += step_um;
+ 			odo_mm = odo_um / 1000;
+ 			/* heading: (right - left) / track radians, as 0.1 deg */
+ 			diff_um += (long long)(d1 - d0) * ENC_UM_PER_STEP;
+ 			head_d10 = (W)((diff_um * 18000LL) / (31416LL * MOT_TRACK_MM));
+-			head_ok = healthy[0] && healthy[1];
++			head_ok = healthy[0] || healthy[1];	/* one good wheel is enough (above) */
+ 		}
+ 		if ((healthy[0] && healthy[1]) == enc_fault) {	/* changed */
+ 			enc_fault = !enc_fault;
