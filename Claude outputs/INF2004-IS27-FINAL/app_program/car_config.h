@@ -52,7 +52,7 @@
      0 = digital D0 on PIN_BARCODE with the 10 ms noise filter: GP7
          (Grove 7 white) on the plug-swap wiring, GP2 on the old wiring.
          No rewiring needed to switch between 0 and 1 on the plug swap. */
-#define BARCODE_READ_A0		0
+#define BARCODE_READ_A0		1
 /* Wheel encoders (quadrature, inside the motors) */
 #if BARCODE_ANALOG
 #define PIN_ENC_L_A		2	/* Grove 2 white (encoder cable moved to Grove 2) */
