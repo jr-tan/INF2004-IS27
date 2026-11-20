@@ -22,7 +22,10 @@
    2 Nov circuit log: 25.5 % duty = 140 mm/s on the mat */
 #define MOT_D0_PM		120		/* duty where the wheels start to turn */
 #define MOT_K_PM_X1000		986		/* + duty per mm/s, x1000 */
-#define MOT_GAIN_L_X1000	1150		/* CAL: left motor is ~15 % weaker */
+/* 20 Nov: was 1150 ("left motor ~15 % weaker").  With the wheels in the
+   air the left one ran FASTER, and at 30 mm/s the +15 % cancelled every
+   left steer (left 15 mm/s got more duty than right 30 mm/s). */
+#define MOT_GAIN_L_X1000	1000
 #define MOT_GAIN_R_X1000	1000
 #define MOT_MAX_MMS		600
 

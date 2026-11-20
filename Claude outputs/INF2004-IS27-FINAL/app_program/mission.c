@@ -262,6 +262,11 @@ LOCAL W leg_done_mm(void) { return motion_odometry_mm() - leg_odo0; }
 #define CLIMB_OFF_MS		600	/* level and moving this long -> normal again */
 #define CLIMB_STALL_WIN_MS	500	/* wheel progress checked over this window */
 #define CLIMB_STALL_STEPS	36	/* < ~3 mm in the window while driven = stalled */
+/* 20 Nov: only a wheel driven at least this fast counts as stalled.  Was
+   15: the INNER wheel while steering (15 mm/s at line speed 30) often does
+   not turn at all, which switched climb mode (70 mm/s, gentle steering) on
+   on flat ground and threw the car off the line. */
+#define CLIMB_STALL_MIN_MMS	25
 #define CLIMB_STUCK_MS		1500	/* stalled this long in climb mode -> back off */
 #define CLIMB_RETRIES		2
 #define CLIMB_BACK_MM		60
@@ -292,7 +297,7 @@ LOCAL BOOL wheels_stalled(UW t)
 	motion_get_status(&ms);
 	wstalled = FALSE;
 	for (m = 0; m < 2; m++) {
-		if (wpos_t != 0 && ms.healthy[m] && ABS(ms.tgt_mms[m]) >= 15 &&
+		if (wpos_t != 0 && ms.healthy[m] && ABS(ms.tgt_mms[m]) >= CLIMB_STALL_MIN_MMS &&
 		    ABS(ms.pos[m] - wpos[m]) < CLIMB_STALL_STEPS)
 			wstalled = TRUE;
 		wpos[m] = ms.pos[m];
