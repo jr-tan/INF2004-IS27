@@ -106,6 +106,7 @@ LOCAL INT ramp(INT cur, INT tgt, INT step)
 LOCAL void motion_task(INT stacd, void *exinf)
 {
 	static const INT gain[2] = { MOT_GAIN_L_X1000, MOT_GAIN_R_X1000 };
+	static const UW um_step[2] = { ENC_L_UM_PER_STEP, ENC_R_UM_PER_STEP };
 	INT cur[2] = {0, 0};		/* ramped wheel speeds, mm/s */
 	INT trim[2] = {0, 0};		/* learned duty correction, pm */
 	UW start_us[2] = {0, 0};	/* when this wheel last left 0 */
@@ -152,7 +153,7 @@ LOCAL void motion_task(INT stacd, void *exinf)
 			UW span = t - hist_t[old];
 			for (m = 0; m < 2; m++) {
 				UW steps = es[m].count - hist_cnt[old][m];
-				v[m] = span ? (INT)((steps * ENC_UM_PER_STEP) / (span / 1000U + 1U)) : 0;
+				v[m] = span ? (INT)((steps * um_step[m]) / (span / 1000U + 1U)) : 0;
 			}
 		}
 		for (m = 0; m < 2; m++) hist_cnt[hi][m] = es[m].count;
@@ -256,7 +257,7 @@ LOCAL void motion_task(INT stacd, void *exinf)
 		   motors were pure open loop at ~15 % duty: any slope stalled
 		   them.  Now each wheel learns from TRIM_MIN_MMS up. */
 		trim_on = FALSE;
-		if (n_hist == ENC_WINDOW_TICKS) {
+		if (MOT_TRIM_ON && n_hist == ENC_WINDOW_TICKS) {
 			for (m = 0; m < 2; m++) {
 				INT err;
 				if (!healthy[m] || !fresh[m] || boost[m] != 0 ||
@@ -287,12 +288,13 @@ LOCAL void motion_task(INT stacd, void *exinf)
 				W est = cur[g] ? (W)((dg * cur[g ^ 1U]) / cur[g]) : 0;
 				if (g) d0 = est; else d1 = est;
 			}
-			if (healthy[0] || healthy[1]) step_um = ((d0 + d1) * ENC_UM_PER_STEP) / 2;
+			if (healthy[0] || healthy[1])
+				step_um = (d0 * (W)ENC_L_UM_PER_STEP + d1 * (W)ENC_R_UM_PER_STEP) / 2;
 			else step_um = (W)(((cur[0] + cur[1]) / 2) * (INT)(dt_us / 1000U));
 			odo_um += step_um;
 			odo_mm = odo_um / 1000;
 			/* heading: (right - left) / track radians, as 0.1 deg */
-			diff_um += (long long)(d1 - d0) * ENC_UM_PER_STEP;
+			diff_um += (long long)d1 * ENC_R_UM_PER_STEP - (long long)d0 * ENC_L_UM_PER_STEP;
 			head_d10 = (W)((diff_um * 18000LL) / (31416LL * MOT_TRACK_MM));
 			head_ok = healthy[0] || healthy[1];	/* one good wheel is enough (above) */
 		}

@@ -35,6 +35,13 @@
    x4 quadrature: ~2490 steps per wheel turn, 65 mm wheel
    => pi * 65000 um / 2490 = 82 um per step */
 #define ENC_UM_PER_STEP		82
+/* 20 Nov: per-wheel scale.  Since the plug swap the left encoder reads
+   1.3x the right on a straight hand push (2.2x while driven).  CAL: push
+   the car straight along a ruler for exactly 500 mm and note how many
+   counts each wheel added (console "enc L" / "enc R"); then
+   um per step = 500000 / counts.  Both 82 = old behaviour. */
+#define ENC_L_UM_PER_STEP	ENC_UM_PER_STEP
+#define ENC_R_UM_PER_STEP	ENC_UM_PER_STEP
 /* CAL: wheel track = distance between the centres of the two wheels
    (where they touch the floor).  Turning heading = (right - left) / track.
    Check: turn the car one full circle on the spot by hand; the console
@@ -46,6 +53,12 @@
 #define ENC_MIN_MMS		40		/* below this the speed reading is too coarse */
 
 /* ---- encoder trim (the "hybrid" part): per-wheel speed control ---- */
+/* 20 Nov: 0 = test switch.  No encoder speed correction: the motors run
+   on the open-loop duty (+ start kick + stall boost) only, like the car
+   did before 12 Nov evening.  If driving gets better with 0, the
+   encoder readings are what is breaking it: calibrate the per-wheel
+   scale above, then set back to 1. */
+#define MOT_TRIM_ON		1
 #define TRIM_KI_X1000		100		/* duty pm per (mm/s error) per tick, x1000 */
 #define TRIM_MAX_PM		300		/* never more than +-30 % duty (was 15 %:
 						   not enough to hold speed up a slope) */
