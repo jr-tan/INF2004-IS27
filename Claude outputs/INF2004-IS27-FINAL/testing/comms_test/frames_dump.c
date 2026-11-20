@@ -34,5 +34,20 @@ int main(void)
 		dump("resources", b, fr_resources(b, 3210, &r));
 	}
 	dump("saturate", b, fr_motion(b, 0, 5000, -5000, 99999, 0, 0));
+	{
+		/* barcode map: A=L B=R C=U D=S Z=S, rest straight */
+		uint8_t act[FR_MAP_LETTERS] = { 1, 2, 3, 4 }, back[FR_MAP_LETTERS], bad[FR_MAP_BYTES];
+		uint32_t ok, i;
+		act[25] = 4;
+		dump("map_ack", b, fr_map_ack(b, act, 1));
+		ok = fr_map_decode(b, FR_MAP_BYTES, back);		/* first 10 bytes = robot/map */
+		for (i = 0; i < FR_MAP_LETTERS; i++) ok = ok && back[i] == act[i];
+		ok = ok && !fr_map_decode(b, FR_MAP_ACK_BYTES, back);	/* wrong length */
+		for (i = 0; i < FR_MAP_BYTES; i++) bad[i] = b[i];
+		bad[0] = (uint8_t)((bad[0] & ~7U) | 5U);		/* A = 5: no such action */
+		back[0] = 9;
+		ok = ok && !fr_map_decode(bad, FR_MAP_BYTES, back) && back[0] == 9;	/* untouched */
+		printf("mapdecode %d\n", (int)ok);
+	}
 	return 0;
 }

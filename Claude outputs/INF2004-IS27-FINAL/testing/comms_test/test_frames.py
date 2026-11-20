@@ -9,7 +9,9 @@ import comms_codec as c
 out = subprocess.check_output([os.path.join(here, "frames_dump")], text=True)
 rows = [l.split() for l in out.splitlines()]
 speedcmd = int([v for k, v in rows if k == "speedcmd"][0])
-fr = {k: bytes.fromhex(v) for k, v in rows if k != "speedcmd"}
+mapdecode = int([v for k, v in rows if k == "mapdecode"][0])
+fr = {k: bytes.fromhex(v) for k, v in rows if k not in ("speedcmd", "mapdecode")}
+MAP = [1, 2, 3, 4] + [0] * 21 + [4]
 want = {
     "status":   (c.decode_status,   {"seq": 7, "up_s": 123456, "mode": "AVOID", "faults": 0x203, "tx_drop": True}),
     "fault":    (c.decode_fault,    {"t_ms": 70000 & 0xFFFF, "raised": 0x088}),
@@ -25,6 +27,7 @@ want = {
                                        "mbfs_max": 12, "cycs": 1, "cycs_max": 12, "queue_pct": 5, "drops": 0,
                                        "motion_us": 187, "line_us": 96}),
     "saturate": (c.decode_motion,   {"vl": 1023, "vr": -1024, "dist_cm": 16383}),
+    "map_ack":  (c.decode_map_ack,  {"map": MAP, "received": True, "text": "A=L B=R C=U D=S Z=S"}),
 }
 fails = 0
 ok_sp = (speedcmd == 120 and c.encode_tune(120, 40, 1800) == bytes([0, 12, 40, 18]) and
@@ -32,6 +35,18 @@ ok_sp = (speedcmd == 120 and c.encode_tune(120, 40, 1800) == bytes([0, 12, 40, 1
          c.encode_tune(120, 40, 1800, False) == bytes([0, 12, 40, 18, 1]))
 print("tuning command      %s" % ("OK" if ok_sp else "WRONG (%d)" % speedcmd))
 fails += not ok_sp
+# GUI side: text box -> robot/map bytes must be what the car's C decoder reads
+ok_map = (mapdecode == 1 and c.parse_map_text("A=L b=r, C=U; D=S Z=STOP") == MAP and
+          c.encode_map(MAP) == fr["map_ack"][:10] and c.decode_map(c.encode_map(MAP)) == MAP and
+          c.parse_map_text("") == [0] * 26)
+for bad in ("A=X", "AB=L", "A", "1=L"):
+    try:
+        c.parse_map_text(bad)
+        ok_map = False
+    except ValueError:
+        pass
+print("barcode map         %s" % ("OK" if ok_map else "WRONG"))
+fails += not ok_map
 for k, (dec, exp) in want.items():
     got = dec(fr[k])
     bad = {f: (got[f], v) for f, v in exp.items() if got[f] != v}

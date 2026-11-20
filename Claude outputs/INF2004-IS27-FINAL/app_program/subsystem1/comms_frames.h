@@ -29,6 +29,10 @@
  *	                   mbfs max 4, cycs 4, cycs max 4, out-queue fill % 7,
  *	                   tx drops 8, motion loop us 12, line loop us 12     15
  *	robot/cmd codes: 1 START 2 STOP 3 PAUSE 4 RESUME 5 PING 6 U-TURN 7 REVERSE
+ *	robot/map (in,     26 x action 3 (letter A first), pad 2            10
+ *	  GUI, retained)   action: 0 straight 1 left 2 right 3 U-turn 4 stop
+ *	robot/tlm/map      the map the car is using (same 10 bytes),
+ *	                   then flags 8 (bit 0 = a map arrived since boot)   11
  *
  *	The status / fault / cmd layouts are the team's (docs/buddy1_comms.md),
  *	so the existing dashboard still decodes them.
@@ -48,6 +52,10 @@
 #define FR_TERRAIN_BYTES	7
 #define FR_OBSTACLE_BYTES	8
 #define FR_RESOURCES_BYTES	15
+#define FR_MAP_BYTES		10
+#define FR_MAP_ACK_BYTES	11
+#define FR_MAP_LETTERS		26
+#define FR_MAP_ACT_MAX		4	/* = BC_ACT_END */
 
 /* system mode on the wire (team's SYS_MODES list) */
 #define SYS_INIT		0
@@ -92,5 +100,11 @@ uint32_t fr_resources(uint8_t *b, uint32_t t_ms, const FR_RES *r);
 
 /* robot/cmd: returns code (1..7) or 0 if invalid; *id = 0..31 */
 uint32_t fr_cmd_decode(const uint8_t *b, uint32_t len, uint32_t *id);
+
+/* robot/map: fills act[26] and returns 1 if b is exactly FR_MAP_BYTES
+   with every action 0..FR_MAP_ACT_MAX; else 0 and act is untouched. */
+uint32_t fr_map_decode(const uint8_t *b, uint32_t len, uint8_t *act);
+/* robot/tlm/map: the map in use + flags (bit 0 = received) */
+uint32_t fr_map_ack(uint8_t *b, const uint8_t *act, uint32_t received);
 
 #endif

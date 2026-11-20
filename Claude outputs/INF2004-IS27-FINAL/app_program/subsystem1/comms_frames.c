@@ -162,3 +162,25 @@ uint32_t fr_cmd_decode(const uint8_t *b, uint32_t len, uint32_t *id)
 	*id = (uint32_t)b[0] >> 3;
 	return (code >= 1 && code <= 7) ? code : 0;
 }
+
+uint32_t fr_map_decode(const uint8_t *b, uint32_t len, uint8_t *act)
+{
+	uint32_t i;
+	if (len != FR_MAP_BYTES) return 0;
+	for (i = 0; i < FR_MAP_LETTERS; i++) {
+		if (bits_get(b, i * 3U, 3U) > FR_MAP_ACT_MAX) return 0;
+	}
+	for (i = 0; i < FR_MAP_LETTERS; i++) act[i] = (uint8_t)bits_get(b, i * 3U, 3U);
+	return 1;
+}
+
+uint32_t fr_map_ack(uint8_t *b, const uint8_t *act, uint32_t received)
+{
+	uint32_t i;
+	zero(b, FR_MAP_ACK_BYTES);
+	for (i = 0; i < FR_MAP_LETTERS; i++) {
+		bits_put(b, i * 3U, 3U, act[i] > FR_MAP_ACT_MAX ? 0U : act[i]);
+	}
+	b[FR_MAP_BYTES] = (uint8_t)(received ? 1U : 0U);
+	return FR_MAP_ACK_BYTES;
+}

@@ -125,10 +125,42 @@ LOCAL void send_resources(void)
 	publish(COMMS_TOPIC_RESOURCES, f, FR_RESOURCES_BYTES);
 }
 
+/* robot/tlm/map: the barcode map the car is really using, so the GUI
+   can show it was received.  Sent on a new map, on (re)connect and every
+   MAP_ACK_S seconds. */
+#define MAP_ACK_S	5U
+LOCAL void send_map_ack(void)
+{
+	UB f[COMMS_FRAME_MAX], act[BC_MAP_LETTERS];
+	BOOL got = barcode_get_map(act);
+	fr_map_ack(f, act, got ? 1U : 0U);
+	publish(COMMS_TOPIC_MAP_ACK, f, FR_MAP_ACK_BYTES);
+}
+
+LOCAL void on_map(const UB *b, UINT len)
+{
+	static const char letter[] = "-LRUS";
+	UB act[BC_MAP_LETTERS];
+	UINT i, k = 0;
+
+	if (!fr_map_decode(b, len, act)) {
+		tm_printf((UB*)"COMMS barcode map rejected (%d bytes, need %d)\n", (INT)len, FR_MAP_BYTES);
+		return;
+	}
+	barcode_set_map(act);
+	tm_printf((UB*)"COMMS barcode map from GUI:");
+	for (i = 0; i < BC_MAP_LETTERS; i++) {
+		if (act[i] != BC_ACT_NONE) { tm_printf((UB*)" %c=%c", (INT)('A' + i), (INT)letter[act[i]]); k++; }
+	}
+	tm_printf((UB*)"%s\n", k ? " (rest straight)" : " all straight");
+	send_map_ack();
+}
+
 /* ===================== comms task ===================== */
 LOCAL void comms_task(INT stacd, void *exinf)
 {
 	UINT tick = 0, seq = 0, last_faults = 0, last_obs = 0, last_bc = 0;
+	BOOL mqtt_was_up = FALSE;
 	UB f[COMMS_FRAME_MAX], rx[COMMS_RX_MAX];
 #if TM_NET_LWIP
 	T_CYW43_UTK_STATUS ws;
@@ -148,6 +180,10 @@ LOCAL void comms_task(INT stacd, void *exinf)
 			int32_t mms, bend, kp, pivot;
 			UINT code = fr_cmd_decode(rx, (UW)n, &id);
 			rx_cmds++;
+			if (n >= 1 && rx[0] == COMMS_RX_MAP_MARK) {	/* robot/map */
+				on_map(&rx[1], (UINT)n - 1U);
+				continue;
+			}
 			if (fr_cmd_tune(rx, (UW)n, &mms, &bend, &kp, &pivot)) {
 				line_set_tuning((INT)mms, (INT)bend, (INT)kp);
 				if (pivot == 1 || pivot == 2) line_set_pivot(pivot == 2);
@@ -209,6 +245,11 @@ LOCAL void comms_task(INT stacd, void *exinf)
 			publish(COMMS_TOPIC_TLM_OBSTACLE, f, FR_OBSTACLE_BYTES);
 		}
 		(void)last_obs;
+
+		/* barcode map in use: on connect, then every MAP_ACK_S */
+		if (mqtt_up && (!mqtt_was_up || (tick % (MAP_ACK_S * 1000U / COMMS_PERIOD_MS)) == 7))
+			send_map_ack();
+		mqtt_was_up = mqtt_up;
 
 		/* resource usage, once a second */
 		if ((tick % (1000 / COMMS_PERIOD_MS)) == 3) send_resources();
@@ -346,7 +387,7 @@ EXPORT ER subsystem1_init(void)
 	cmbf.bufsz  = PUB_BUFSZ;		/* ~24 frames queued */
 	cmbf.maxmsz = 1 + COMMS_FRAME_MAX;
 	if ((mbf_pub = tk_cre_mbf(&cmbf)) < E_OK) return mbf_pub;
-	cmbf.bufsz  = 8 * 12;
+	cmbf.bufsz  = 8 * (COMMS_RX_MAX + 4U);
 	cmbf.maxmsz = COMMS_RX_MAX;
 	if ((mbf_rx = tk_cre_mbf(&cmbf)) < E_OK) return mbf_rx;
 	return E_OK;

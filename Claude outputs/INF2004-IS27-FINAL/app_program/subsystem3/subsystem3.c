@@ -9,6 +9,10 @@
  *	  5. three junction samples in a row (both black) -> EV_JUNCTION for
  *	     the mission (barcode turns), unless barcode bars are passing
  *	The ADC is only touched here.  The barcode reader is barcode.c.
+ *	16 Nov, BARCODE_ANALOG: the ADC free-runs round-robin over the
+ *	analog pins in use (line L/R + barcode A0), 1000 samples a second
+ *	each, into its FIFO; the FIFO interrupt keeps the newest line
+ *	readings for this task and hands every barcode sample to barcode.c.
  */
 #include "../car.h"
 #include "line_ctl.h"
@@ -120,11 +124,113 @@ LOCAL void analog_pin(UINT pin)
 	set_w(GPIO(pin), GPIO_OD);
 }
 
+/* ---------------- ADC scan (BARCODE_ANALOG) ---------------- */
+#define ADC_FCS		(0x4004C000U + 0x08U)
+#define ADC_FIFO	(0x4004C000U + 0x0CU)
+#define ADC_DIV		(0x4004C000U + 0x10U)
+#define ADC_INTE	(0x4004C000U + 0x18U)
+#define ADC_START_MANY	(1U << 3)
+#define ADC_RROBIN(m)	((UW)(m) << 16)
+#define FCS_EN		(1U << 0)
+#define FCS_UNDER	(1U << 10)
+#define FCS_OVER	(1U << 11)
+#define FCS_LEVEL(f)	(((f) >> 16) & 0xFU)
+#define FCS_THRESH(n)	((UW)(n) << 24)
+#define ADC_IRQ_NO	22		/* ADC_IRQ_FIFO */
+#define ADC_IRQ_PRI	2		/* same as the GPIO edges */
+#define ADC_CLK_HZ	48000000U	/* CLK_ADC_FREQ */
+#define ADC_PER_CH_HZ	((UINT)BC_ADC_RATE_HZ)	/* samples a second per channel */
+
+LOCAL volatile UH adc_last[4];		/* newest raw sample per channel */
+LOCAL volatile BOOL adc_scan_on;	/* line task reads adc_last[] */
+LOCAL volatile BOOL adc_single;		/* line task fell back to single reads */
+LOCAL UB  adc_ch[4];			/* round-robin order */
+LOCAL UINT adc_nch, adc_idx;
+LOCAL UW  adc_conv_us;			/* time between two conversions */
+EXPORT volatile UW adc_resync;		/* FIFO over/underflows (should stay 0) */
+
+LOCAL void adc_scan_restart(void)
+{
+	UINT spin = 0;
+	clr_w(ADC_CS, ADC_START_MANY);
+	while (!(in_w(ADC_CS) & ADC_READY) && ++spin < 2000) { }
+	while (FCS_LEVEL(in_w(ADC_FCS)) != 0) (void)in_w(ADC_FIFO);
+	out_w(ADC_FCS, FCS_EN | FCS_THRESH(1) | FCS_UNDER | FCS_OVER);	/* W1C the errors */
+	adc_idx = 0;
+	out_w(ADC_CS, ADC_EN | ADC_AINSEL(adc_ch[0]) |
+		      ADC_RROBIN((1U << (PIN_LINE_L - 26)) | (1U << (PIN_LINE_R - 26)) |
+				 (1U << (PIN_BARCODE_ADC - 26))) | ADC_START_MANY);
+}
+
+LOCAL void adc_isr(UINT intno)
+{
+	UW now = in_w(TIMER_TIMERAWL);
+	UW fcs = in_w(ADC_FCS);
+	UINT n, k;
+
+	(void)intno;
+	if (fcs & (FCS_OVER | FCS_UNDER)) {	/* lost our place in the rotation */
+		adc_resync++;
+		adc_scan_restart();
+		return;
+	}
+	n = FCS_LEVEL(fcs);
+	for (k = n; k > 0; k--) {		/* oldest first */
+		UINT v = in_w(ADC_FIFO) & 0xFFFU;
+		UINT ch = adc_ch[adc_idx];
+		adc_idx = (adc_idx + 1U < adc_nch) ? adc_idx + 1U : 0U;
+		adc_last[ch] = (UH)v;
+		if (ch == PIN_BARCODE_ADC - 26U)
+			barcode_adc_sample(v, now - (k - 1U) * adc_conv_us);
+	}
+}
+
+/* core 0 (the barcode task): start the scan.  FALSE if the line task
+   already fell back to single reads. */
+EXPORT BOOL adc_scan_start(void)
+{
+#if BARCODE_ANALOG
+	T_DINT dint;
+	UINT c, total;
+
+	if (adc_single) return FALSE;
+	analog_pin(PIN_LINE_L);
+	analog_pin(PIN_LINE_R);
+	analog_pin(PIN_BARCODE_ADC);
+	adc_nch = 0;
+	for (c = 0; c < 3; c++) {		/* hardware visits channels in rising order */
+		if (c == PIN_LINE_L - 26U || c == PIN_LINE_R - 26U || c == PIN_BARCODE_ADC - 26U)
+			adc_ch[adc_nch++] = (UB)c;
+	}
+	total = ADC_PER_CH_HZ * adc_nch;
+	adc_conv_us = 1000000U / total;
+	out_w(ADC_INTE, 0);
+	out_w(ADC_CS, ADC_EN);
+	out_w(ADC_DIV, (ADC_CLK_HZ / total - 1U) << 8);	/* integer part, no fraction */
+	dint.intatr = TA_HLNG;
+	dint.inthdr = (FP)adc_isr;
+	if (tk_def_int(ADC_IRQ_NO, &dint) < E_OK) return FALSE;	/* replaces the unused "adca" driver */
+	ClearInt(ADC_IRQ_NO);
+	adc_scan_restart();
+	out_w(ADC_INTE, 1U);			/* FIFO level >= threshold */
+	EnableInt(ADC_IRQ_NO, ADC_IRQ_PRI);
+	adc_scan_on = TRUE;
+	return TRUE;
+#else
+	(void)adc_isr;				/* wired for D0: scan not used */
+	return FALSE;
+#endif
+}
+
 LOCAL UINT adc_read(UINT ch)
 {
 	UINT spin = 0;
 	UINT v;
 
+	if (adc_scan_on) {			/* scan running: newest sample */
+		v = adc_last[ch];
+		return LINE_BLACK_IS_HIGH ? v : 4095U - v;
+	}
 	out_w(ADC_CS, ADC_EN | ADC_AINSEL(ch) | ADC_START_ONCE);
 	while (!(in_w(ADC_CS) & ADC_READY)) {
 		if (++spin > 2000) return 0;		/* ~2 us normally */
@@ -146,9 +252,20 @@ LOCAL void line_task(INT stacd, void *exinf)
 	UINT i;
 
 	(void)stacd; (void)exinf;
-	analog_pin(PIN_LINE_L);
-	analog_pin(PIN_LINE_R);
-	set_w(ADC_CS, ADC_EN);
+#if BARCODE_ANALOG
+	/* the barcode task (core 0) starts the ADC scan; never touch the ADC
+	   registers while it may be doing so.  Give it 2 s, then fall back. */
+	for (i = 0; i < 200 && !adc_scan_on; i++) tk_dly_tsk(10);
+	if (!adc_scan_on) {
+		adc_single = TRUE;
+		tm_printf((UB*)"LINE: ADC scan not started, single reads (barcode A0 off)\n");
+	}
+#endif
+	if (!adc_scan_on) {
+		analog_pin(PIN_LINE_L);
+		analog_pin(PIN_LINE_R);
+		set_w(ADC_CS, ADC_EN);
+	}
 	tune_straddle = line_tune_default;
 	tune_inside = line_tune_inside;
 	tune_edge = line_tune_edge;

@@ -6,6 +6,8 @@ Connects to the MQTT broker, decodes the car's binary frames
 (comms_codec.py) and sorts them into one dataset per topic:
 
   Overview   mode, uptime, fault lamps, live values, event log, commands
+  Barcode map  A=L B=R C=U D=S box: sent retained on robot/map, the car
+             confirms the map it is using on robot/tlm/map
   Motion     wheel speeds + distance (robot/tlm/motion)
   Line       line position, sensor mode, barcodes (robot/tlm/line)
   Terrain    pitch, roll, compass, humps (robot/tlm/terrain)
@@ -35,7 +37,8 @@ import time
 import tkinter as tk
 from tkinter import ttk, filedialog, messagebox
 
-from comms_codec import (DECODERS, CMD_CODES, FAULT_NAMES, encode, encode_cmd, encode_tune)
+from comms_codec import (DECODERS, CMD_CODES, FAULT_NAMES, encode, encode_cmd, encode_tune,
+                         parse_map_text, encode_map, decode_map, map_to_text, MAP_LETTERS)
 
 try:
     import paho.mqtt.client as mqtt
@@ -218,6 +221,8 @@ class App:
         self.last = {}                  # latest decoded value per topic
         self.prev_mode = None
         self.prev_bc = None
+        self.map_seen = False           # broker's retained robot/map shown in the box yet?
+        self.car_map = None             # last robot/tlm/map from the car
         self.prev_hump_ev = 0
         self.prev_faults = 0
         self.last_sweep = None
@@ -319,6 +324,25 @@ class App:
         self.b_speed.pack(side="left", padx=8)
         self.cmd_buttons.append(self.b_speed)
         ttk.Label(tune, text="(car resets these on restart)", foreground=MUTED).pack(side="left")
+
+        # barcode letter -> action.  Retained on the broker, so the car gets
+        # it again whenever it (re)connects.  Letters not named go straight.
+        bmap = ttk.Frame(r, padding=(10, 0, 10, 6))
+        bmap.pack(fill="x")
+        ttk.Label(bmap, text="Barcode map:").pack(side="left")
+        self.e_map = ttk.Entry(bmap, width=34)
+        self.e_map.insert(0, "A=L B=R C=U D=S")
+        self.e_map.pack(side="left", padx=(4, 4))
+        self.e_map.bind("<Return>", lambda e: self.send_map())
+        self.b_map = ttk.Button(bmap, text="Send map", command=self.send_map)
+        self.b_map.pack(side="left", padx=3)
+        self.b_map_clear = ttk.Button(bmap, text="Clear map", command=lambda: self.send_map(clear=True))
+        self.b_map_clear.pack(side="left", padx=3)
+        self.cmd_buttons += [self.b_map, self.b_map_clear]
+        ttk.Label(bmap, text="L left  R right  U U-turn  S stop  (others: straight)",
+                  foreground=MUTED).pack(side="left", padx=(8, 0))
+        self.l_map = ttk.Label(bmap, text="Car is using: (not heard yet)", foreground=MUTED)
+        self.l_map.pack(side="right")
         ttk.Button(cmd, text="Export all CSV", command=self.export_all).pack(side="right")
         ttk.Button(cmd, text="Clear all", command=self.clear_all).pack(side="right", padx=6)
 
@@ -567,6 +591,7 @@ class App:
             c = mqtt.Client(client_id="is27-gui-%d" % random.randint(0, 99999))
 
         def on_connect(cl, u, flags, rc, props=None):
+            self.map_seen = False
             cl.subscribe(root + "/#", qos=1)
             self.q.put(("conn", True, "connected to %s" % host))
 
@@ -609,6 +634,24 @@ class App:
             self.client.publish(self.root_topic + "/cmd", frame, qos=1, retain=False)
         self.event("sent TUNING speed %d mm/s, bends %d %%, KP %d, pivot %s" %
                    (frame[1] * 10, frame[2], frame[3] * 100, "on" if frame[4] == 2 else "off"))
+
+    def send_map(self, clear=False):
+        """Publish the barcode map to <root>/map, QoS 1, retained."""
+        text = "" if clear else self.e_map.get()
+        try:
+            act = parse_map_text(text)
+        except ValueError as e:
+            messagebox.showerror("Barcode map", "%s\n\nExample: A=L B=R C=U D=S" % e)
+            return
+        if clear:
+            self.e_map.delete(0, "end")
+        frame = encode_map(act)
+        if self.demo:
+            self.demo.bc_map = act
+            self.handle(time.time(), "tlm/map", frame + b"\x01")     # the demo car confirms at once
+        elif self.client:
+            self.client.publish(self.root_topic + "/map", frame, qos=1, retain=True)
+        self.event("sent barcode map: %s" % map_to_text(act))
 
     def send(self, name):
         self.cmd_id = (self.cmd_id + 1) % 32
@@ -656,6 +699,18 @@ class App:
     def handle(self, t, sub, payload):
         self.msgs += 1
         self.last_rx = t
+        if sub == "map":                # our own retained map, echoed by the broker
+            if not self.map_seen and len(payload) == 10:
+                self.map_seen = True    # first one after connecting: show what the broker holds
+                try:
+                    act = decode_map(payload)
+                except ValueError:
+                    return
+                if all(0 <= c <= 4 for c in act):
+                    self.e_map.delete(0, "end")
+                    self.e_map.insert(0, " ".join("%s=%s" % (chr(65 + i), "-LRUS"[c])
+                                                  for i, c in enumerate(act) if c))
+            return
         dec = DECODERS.get(sub)
         if dec is None:
             return
@@ -716,6 +771,13 @@ class App:
                 self.event("obstacle: stopped at %d cm" % d["dist_cm"])
             else:
                 self.event("obstacle: %s" % d["stage"].lower().replace("_", " "))
+        elif sub == "tlm/map":
+            src = "from GUI" if d["received"] else "built-in, GUI map not received"
+            self.l_map.configure(text="Car is using: %s (%s)" % (d["text"], src),
+                                 foreground=INK if d["received"] else AMBER)
+            if (d["map"], d["received"]) != self.car_map:
+                self.car_map = (d["map"], d["received"])
+                self.event("car barcode map: %s (%s)" % (d["text"], src))
         elif sub == "tlm/resources":
             self.ds["resources"].add({"t": t, **{k: d[k] for k in self.ds["resources"].columns}})
 
@@ -919,6 +981,7 @@ class DemoCar(threading.Thread):
         self.back_to_line = 0
         self.speed, self.bend, self.kp = 30, 50, 1000
         self.pivot = False
+        self.bc_map = [0] * MAP_LETTERS
 
     def command(self, name):
         self.mode = {"START": 2, "RESUME": 2, "STOP": 1, "PAUSE": 6, "UTURN": 3, "REVERSE": 5}.get(name, self.mode)
@@ -954,7 +1017,8 @@ class DemoCar(threading.Thread):
             pos = int(curve * 900 + random.gauss(0, 40)) if moving else 0
             mode = (7 if self.pivot and abs(pos) > 600 else 1) if abs(pos) > 150 else 2
             if moving and int(t) % 20 == 10 and k % 5 == 0:
-                bc_char, bc_act = random.choice([(ord("A"), 1), (ord("B"), 2), (ord("Z"), 0)])
+                bc_char = random.choice([ord("A"), ord("B"), ord("C"), ord("Z")])
+                bc_act = self.bc_map[bc_char - ord("A")]
             ph = (t % 25)
             pitch = 120 * math.sin((ph - 10) / 1.2 * math.pi) if 10 < ph < 12.4 and moving else random.gauss(0, 5)
             hump_ev = 1 if 12.4 < ph < 13.4 and moving else 0

@@ -25,11 +25,13 @@ typedef enum {
 	COMMS_TOPIC_STATUS       = 4,	/* robot/status (retained) */
 	COMMS_TOPIC_FAULT        = 5,	/* robot/event/fault (QoS 1) */
 	COMMS_TOPIC_RESOURCES    = 6,	/* robot/tlm/resources */
-	COMMS_TOPIC_COUNT        = 7
+	COMMS_TOPIC_MAP_ACK      = 7,	/* robot/tlm/map (barcode map in use) */
+	COMMS_TOPIC_COUNT        = 8
 } comms_topic_t;
 
 #define COMMS_FRAME_MAX		(16U)	/* largest payload, bytes (resources = 15) */
-#define COMMS_RX_MAX		(8U)	/* largest inbound command */
+#define COMMS_RX_MAX		(12U)	/* largest inbound: marker + 10-byte map */
+#define COMMS_RX_MAP_MARK	(0xFFU)	/* rx[0] of a robot/map payload (never a valid cmd) */
 
 uint16_t comms_port_tx_pop(uint8_t *topic, uint8_t *frame, uint16_t cap);
 void comms_port_rx_push(const uint8_t *frame, uint16_t len);

@@ -162,6 +162,15 @@ typedef struct {
 } BARCODE_INFO;
 IMPORT void barcode_get(BARCODE_INFO *b);
 IMPORT BOOL barcode_busy(void);		/* bars passing right now (or just did) */
+/* BARCODE_ANALOG: the ADC interrupt (subsystem3.c, core 0) hands every
+   A0 sample here with its timer stamp */
+IMPORT void barcode_adc_sample(UINT raw, UW t_us);
+IMPORT BOOL adc_scan_start(void);	/* core 0 only; FALSE = not started */
+#define BC_MAP_LETTERS		26	/* A..Z */
+/* letter -> BC_ACT_* map, set from the GUI (robot/map).  Called by the
+   comms task only.  get returns TRUE once a map has come from the GUI. */
+IMPORT void barcode_set_map(const UB act[BC_MAP_LETTERS]);
+IMPORT BOOL barcode_get_map(UB act[BC_MAP_LETTERS]);
 
 /* ---------------------------------------------------------------------
  *  IMU (subsystem4, GY-511 = LSM303 accel + magnetometer, no gyro)

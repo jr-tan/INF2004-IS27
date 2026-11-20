@@ -13,13 +13,14 @@ FAULT_NAMES = ["MOTOR_STALL", "ENCODER", "IMU", "NO_ECHO", "WIFI_LOSS", "MQTT_LO
                "LINE", "AVOID", "MOTION", "SUDDEN_IMPACT", "COMMS", "(reserved)"]
 CMD_CODES = {"START": 1, "STOP": 2, "PAUSE": 3, "RESUME": 4, "PING": 5, "UTURN": 6, "REVERSE": 7}
 LINE_MODES = ["off", "track", "centred", "recover", "junction", "LOST", "bend stop", "pivot"]
-BC_ACTIONS = ["none", "LEFT", "RIGHT", "U-TURN", "END", "?", "?", "?"]
+BC_ACTIONS = ["straight", "LEFT", "RIGHT", "U-TURN", "END", "?", "?", "?"]
 OWNERS = ["NONE", "LINE", "MISSION", "?"]
 OBST_ACTIONS = ["none", "LEFT", "RIGHT", "BLOCKED"]
 OBST_STAGES = ["FAILED", "DETECTED", "FALSE_ALARM", "SWEPT", "GONE", "BLOCKED", "PASSED", "REJOINED"]
 IMU_EVENTS = ["HUMP", "IMPACT", "TILT"]
 
-SIZES = {"status": 6, "fault": 4, "motion": 7, "line": 8, "terrain": 7, "obstacle": 8, "resources": 15}
+SIZES = {"status": 6, "fault": 4, "motion": 7, "line": 8, "terrain": 7, "obstacle": 8, "resources": 15,
+         "map": 10, "map_ack": 11}
 
 
 def _fields(frame, spec):
@@ -159,8 +160,64 @@ def encode_cmd(name, cmd_id=0):
     return bytes([(cmd_id << 3) | CMD_CODES[name.upper()]])
 
 
+# ---- barcode map (robot/map in, robot/tlm/map back) ----
+# 26 letters x 3 bits, A first, LSB-first like every other frame.
+# Codes match BC_ACT_* in car.h: 0 straight, 1 left, 2 right, 3 U-turn, 4 stop.
+MAP_LETTERS = 26
+MAP_CODES = {"-": 0, "F": 0, "STRAIGHT": 0, "L": 1, "LEFT": 1, "R": 2, "RIGHT": 2,
+             "U": 3, "UTURN": 3, "U-TURN": 3, "S": 4, "STOP": 4}
+MAP_LETTER_OF = "-LRUS"
+
+
+def parse_map_text(text):
+    """'A=L B=R C=U D=S' -> list of 26 codes.  Separators: spaces, commas or
+    semicolons.  Letters not named stay 0 (straight).  Raises ValueError
+    with a message fit to show the user."""
+    act = [0] * MAP_LETTERS
+    for item in text.replace(",", " ").replace(";", " ").split():
+        if "=" not in item:
+            raise ValueError("'%s': write it as LETTER=ACTION, e.g. A=L" % item)
+        k, v = (x.strip().upper() for x in item.split("=", 1))
+        if len(k) != 1 or not "A" <= k <= "Z":
+            raise ValueError("'%s': the barcode must be one letter A..Z" % item)
+        if v not in MAP_CODES:
+            raise ValueError("'%s': action must be L, R, U, S or - (straight)" % item)
+        act[ord(k) - ord("A")] = MAP_CODES[v]
+    return act
+
+
+def map_to_text(act):
+    """list of 26 codes -> 'A=L B=R' (straight letters left out)"""
+    parts = ["%s=%s" % (chr(ord("A") + i), MAP_LETTER_OF[c] if 0 <= c <= 4 else "?")
+             for i, c in enumerate(act) if c != 0]
+    return " ".join(parts) if parts else "all straight"
+
+
+def encode_map(act):
+    """robot/map payload: 10 bytes"""
+    if len(act) != MAP_LETTERS or any(not 0 <= c <= 4 for c in act):
+        raise ValueError("map must be 26 codes 0..4")
+    v = 0
+    for i, c in enumerate(act):
+        v |= c << (3 * i)
+    return v.to_bytes(SIZES["map"], "little")
+
+
+def decode_map(frame):
+    _check(frame, "map")
+    v = int.from_bytes(frame, "little")
+    return [(v >> (3 * i)) & 7 for i in range(MAP_LETTERS)]
+
+
+def decode_map_ack(frame):
+    """robot/tlm/map: the map the car is using + flags (bit 0 = received from GUI)"""
+    _check(frame, "map_ack")
+    act = decode_map(frame[:SIZES["map"]])
+    return {"map": act, "received": bool(frame[SIZES["map"]] & 1), "text": map_to_text(act)}
+
+
 DECODERS = {
     "status": decode_status, "event/fault": decode_fault, "tlm/motion": decode_motion,
     "tlm/line": decode_line, "tlm/terrain": decode_terrain, "tlm/obstacle": decode_obstacle,
-    "tlm/resources": decode_resources,
+    "tlm/resources": decode_resources, "tlm/map": decode_map_ack,
 }

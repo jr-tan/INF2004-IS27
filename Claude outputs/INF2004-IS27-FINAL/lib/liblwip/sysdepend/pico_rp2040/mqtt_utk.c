@@ -15,7 +15,8 @@
  *	    COMMS_PUMP_MS it takes frames that application tasks queued with
  *	    comms_publish() and publishes them as BINARY payloads (Change
  *	    Requirement 11: no text values) on the robot/... topics;
- *	  - the client subscribes to robot/cmd and hands each complete payload to
+ *	  - the client subscribes to robot/cmd and robot/map (barcode map, marked
+ *	    with COMMS_RX_MAP_MARK) and hands each complete payload to
  *	    cmd_dispatch_task;
  *	  - reconnect uses 1 s, 2 s, 4 s ... capped at 10 s backoff (NFR-B1-3).
  *	All hand-over to the rest of the firmware goes through comms_port.h
@@ -56,6 +57,7 @@
 #define MQTT_UTK_RX_DATA_MAX	COMMS_RX_MAX
 
 #define MQTT_CMD_TOPIC		MQTT_TOPIC_ROOT "/cmd"
+#define MQTT_MAP_TOPIC		MQTT_TOPIC_ROOT "/map"	/* barcode map from the GUI, retained */
 
 /* One row per comms_topic_t, in the same order. */
 static const struct {
@@ -70,6 +72,7 @@ static const struct {
 	{ MQTT_TOPIC_ROOT "/status",       0, 1 },	/* COMMS_TOPIC_STATUS (retained) */
 	{ MQTT_TOPIC_ROOT "/event/fault",  1, 0 },	/* COMMS_TOPIC_FAULT (QoS 1) */
 	{ MQTT_TOPIC_ROOT "/tlm/resources", 0, 0 },	/* COMMS_TOPIC_RESOURCES    */
+	{ MQTT_TOPIC_ROOT "/tlm/map",      1, 0 },	/* COMMS_TOPIC_MAP_ACK      */
 };
 
 static mqtt_client_t	*client;
@@ -82,7 +85,13 @@ static u32_t		retry_ms = MQTT_UTK_RETRY_MIN_MS;
  * one or more data callbacks; the payload is kept until the fragment carrying
  * MQTT_DATA_FLAG_LAST shows up. The payload is BINARY: it is never printed as
  * text and never altered. A payload longer than the buffer is discarded whole. */
-static u8_t		rx_is_cmd;
+/* rx_kind: what the message being received is.  A robot/map payload is
+ * handed over with COMMS_RX_MAP_MARK in front so the comms task can tell
+ * it from a command without a second buffer. */
+#define RX_NONE			0
+#define RX_CMD			1
+#define RX_MAP			2
+static u8_t		rx_kind;
 static u8_t		rx_data[MQTT_UTK_RX_DATA_MAX];
 static u16_t		rx_len;
 static u8_t		rx_overflow;
@@ -105,9 +114,13 @@ static void incoming_publish_cb(void *arg, const char *topic, u32_t tot_len)
 	(void)arg;
 	(void)tot_len;
 
-	rx_is_cmd = str_equal(topic, MQTT_CMD_TOPIC);
+	rx_kind = str_equal(topic, MQTT_CMD_TOPIC) ? RX_CMD
+		: str_equal(topic, MQTT_MAP_TOPIC) ? RX_MAP : RX_NONE;
 	rx_len = 0;
 	rx_overflow = 0;
+	if(rx_kind == RX_MAP) {
+		rx_data[rx_len++] = COMMS_RX_MAP_MARK;
+	}
 }
 
 static void incoming_data_cb(void *arg, const u8_t *data, u16_t len, u8_t flags)
@@ -116,7 +129,7 @@ static void incoming_data_cb(void *arg, const u8_t *data, u16_t len, u8_t flags)
 
 	(void)arg;
 
-	if(!rx_is_cmd) {
+	if(rx_kind == RX_NONE) {
 		return;
 	}
 
@@ -129,7 +142,9 @@ static void incoming_data_cb(void *arg, const u8_t *data, u16_t len, u8_t flags)
 	}
 
 	if((flags & MQTT_DATA_FLAG_LAST) != 0) {
-		if(!rx_overflow) {
+		if((rx_kind == RX_MAP) && (rx_len <= 1)) {
+			/* empty retained message = map cleared on the broker: keep the current map */
+		} else if(!rx_overflow) {
 			comms_port_rx_push(rx_data, rx_len);
 #if COMMS_DEBUG
 			tm_printf((UB*)"mqtt: RX cmd %d byte(s), first=0x%02x\n",
@@ -138,7 +153,7 @@ static void incoming_data_cb(void *arg, const u8_t *data, u16_t len, u8_t flags)
 		} else {
 			tm_printf((UB*)"mqtt: RX cmd too long, discarded\n");
 		}
-		rx_is_cmd = 0;
+		rx_kind = RX_NONE;
 	}
 }
 
@@ -146,7 +161,7 @@ static void subscribe_done_cb(void *arg, err_t result)
 {
 	(void)arg;
 	if(result == ERR_OK) {
-		tm_printf((UB*)"mqtt: subscribed to " MQTT_CMD_TOPIC "\n");
+		tm_printf((UB*)"mqtt: subscribed to %s\n", (arg != NULL) ? MQTT_MAP_TOPIC : MQTT_CMD_TOPIC);
 	} else {
 		tm_printf((UB*)"mqtt: subscribe failed, err=%d\n", (int)result);
 	}
@@ -264,6 +279,15 @@ static void connection_cb(mqtt_client_t *c, void *arg, mqtt_connection_status_t 
 				     subscribe_done_cb, NULL);
 		if(err != ERR_OK) {
 			tm_printf((UB*)"mqtt: mqtt_subscribe() failed, err=%d\n",
+				  (int)err);
+		}
+		/* The barcode map is retained, so the broker sends the GUI's
+		 * last map straight after this subscribe (also after a reconnect).
+		 * arg != NULL only tells subscribe_done_cb which topic it was. */
+		err = mqtt_subscribe(client, MQTT_MAP_TOPIC, 1 /* qos */,
+				     subscribe_done_cb, (void *)1);
+		if(err != ERR_OK) {
+			tm_printf((UB*)"mqtt: mqtt_subscribe(map) failed, err=%d\n",
 				  (int)err);
 		}
 

@@ -53,3 +53,24 @@ The **Topic root** must match `MQTT_TOPIC_ROOT` on the car (default `robot`).
 - `is27_gui.py`: the window.
 - `comms_codec.py`: decodes and encodes the binary frames, mirroring `app_program/subsystem1/comms_frames.h`. It is checked against the car's C code by `testing/comms_test`.
 - `comms_dashboard.py`: the old text-only monitor, still works.
+
+## Barcode map (16 Nov)
+
+The row under the tuning controls sets what each barcode letter does.
+Type it as `LETTER=ACTION` pairs, e.g. `A=L B=R C=U D=S`:
+
+| Action | Car does |
+|---|---|
+| `L` | turn left at the next junction |
+| `R` | turn right at the next junction |
+| `U` | U-turn |
+| `S` | stop (end of course) |
+| `-` or not listed | drive straight on |
+
+**Send map** publishes it to `robot/map` (QoS 1, retained), so the car gets it
+again every time it reconnects. **Clear map** sends "all straight".
+The car replies on `robot/tlm/map` every 5 s; the right end of the row shows
+"Car is using: ... (from GUI)". Amber "(built-in, GUI map not received)" means
+the car is still on `BC_ACTION_MAP` from `car_config.h` (all straight by default).
+Payload: 26 x 3 bits, letter A first, LSB-first (10 bytes); the reply adds one
+flags byte (bit 0 = map received). START works with or without a map.

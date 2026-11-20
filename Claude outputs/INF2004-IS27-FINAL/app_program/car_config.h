@@ -32,9 +32,29 @@
 #define MOTOR_L_INVERT		0	/* 1 = swap A/B in software */
 #define MOTOR_R_INVERT		1	/* right motor is mounted mirrored */
 
+/* 16 Nov: read the barcode sensor's A0 (analog) instead of D0.  The ADC
+   scans GP26/27/28 continuously (1000 samples a second each); barcode.c
+   learns the card's white and black levels and switches with a gap
+   between them (hysteresis), so a half-seen narrow bar can't chatter. */
+/* WIRING SWITCH - must match the car:
+     0 = old wiring: barcode D0 on Grove 2 white (GP2), left encoder
+         A/B on Grove 7 white/yellow (GP7/GP28)
+     1 = analog wiring (20 Nov, plug swap, no extra parts):
+         barcode cable plugged into Grove 7: yellow -> barcode A0 (GP28),
+             white -> D0 (GP7, not used), red/black power
+         left encoder cable plugged into Grove 2: white -> A (GP2),
+             yellow -> B (GP3)
+         IMU INT: unplugged (the IMU is polled over I2C)
+   Flash the matching build straight after changing the wires. */
+#define BARCODE_ANALOG		1
 /* Wheel encoders (quadrature, inside the motors) */
-#define PIN_ENC_L_A		7	/* Grove 7 */
-#define PIN_ENC_L_B		28	/* Grove 7 (digital use of GP28) */
+#if BARCODE_ANALOG
+#define PIN_ENC_L_A		2	/* Grove 2 white (encoder cable moved to Grove 2) */
+#define PIN_ENC_L_B		3	/* Grove 2 yellow */
+#else
+#define PIN_ENC_L_A		7	/* Grove 7 white */
+#define PIN_ENC_L_B		28	/* Grove 7 yellow (digital use of GP28) */
+#endif
 #define PIN_ENC_R_A		0	/* Grove 1 */
 #define PIN_ENC_R_B		1	/* Grove 1 */
 #define ENC_L_REVERSE		0	/* left counts up going forward */
@@ -73,17 +93,28 @@
 #define RGB_COUNT		2
 
 /* Barcode + IMU */
-#define PIN_BARCODE		2	/* Grove 2, barcode sensor D0 (edges via gpio_irq) */
+#if BARCODE_ANALOG
+#define PIN_BARCODE		7	/* Grove 7 white, barcode D0: claimed, not read */
+#else
+#define PIN_BARCODE		2	/* Grove 2 white, barcode sensor D0 */
+#endif
 #define BARCODE_BLACK_IS_HIGH	1	/* 0 if D0 reads LOW on black */
-/* DEMO DAY: what each letter does, one character per letter A..Z
-   (lower case letters act like upper case):
+#define PIN_BARCODE_ADC		28	/* Grove 7 yellow, ADC2 = barcode A0 */
+#define BARCODE_A0_BLACK_IS_HIGH 1	/* 0 if A0 reads LOWER on black */
+#define BC_ADC_MIN_SPAN		150	/* white..black must differ by this (of 4095) */
+#define BC_ADC_RATE_HZ		1000	/* A0 samples a second (each ADC pin) */
+/* Barcode letter -> action.  The GUI sets this over MQTT ("Barcode map"
+   box, e.g. A=L B=R C=U D=S); this is only what the car uses from boot
+   until the GUI's map arrives, or with no WiFi at all.  One character per
+   letter A..Z (lower case letters act like upper case):
      L = turn left at the next junction    R = turn right
      U = U-turn                            S = stop (end of course)
-     - = just report it
-   e.g. A = left, B = right, C = U-turn, D = stop, rest report only: */
-#define BC_ACTION_MAP		"LRUS----------------------"
+     - = drive straight on (report only)
+   Default: all straight.  For a demo without WiFi put letters back,
+   e.g. "LRUS----------------------" = A left, B right, C U-turn, D stop. */
+#define BC_ACTION_MAP		"--------------------------"
 /*                             ABCDEFGHIJKLMNOPQRSTUVWXYZ */
-#define PIN_IMU_INT		3	/* Grove 2, GY-511 INT1: claimed, IMU is polled */
+/* GY-511 INT1 is not wired: the IMU is polled over I2C (GP3 went to the left encoder) */
 #define PIN_IMU_SDA		4	/* Grove 3, I2C0 SDA */
 #define PIN_IMU_SCL		5	/* Grove 3, I2C0 SCL */
 #define I2C_IMU			0	/* GP4/GP5 = I2C0 */
@@ -160,6 +191,12 @@
 #define CC_ASSERT(cond, msg)	_Static_assert(cond, msg)
 #define BIT64(p)		(1ULL << (p))
 
+#if BARCODE_ANALOG
+#define BC_ADC_PIN_BIT		BIT64(PIN_BARCODE_ADC)
+#else
+#define BC_ADC_PIN_BIT		0ULL
+#endif
+
 /* Every pin configured or claimed by this firmware */
 #define USED_PINS_SUM	(BIT64(PIN_MOTOR_L_A) + BIT64(PIN_MOTOR_L_B) + \
 	BIT64(PIN_MOTOR_R_A) + BIT64(PIN_MOTOR_R_B) + \
@@ -168,7 +205,7 @@
 	BIT64(PIN_US_TRIG) + BIT64(PIN_US_ECHO) + BIT64(PIN_SERVO) + \
 	BIT64(PIN_ALERT_LED) + BIT64(PIN_STATUS_LED) + BIT64(PIN_BTN_START) + \
 	BIT64(PIN_BTN_STOP) + BIT64(PIN_BUZZER) + BIT64(PIN_BARCODE) + \
-	BIT64(PIN_IMU_INT) + BIT64(PIN_IMU_SDA) + BIT64(PIN_IMU_SCL) + BIT64(PIN_RGB))
+	BC_ADC_PIN_BIT + BIT64(PIN_IMU_SDA) + BIT64(PIN_IMU_SCL) + BIT64(PIN_RGB))
 #define USED_PINS_OR	(BIT64(PIN_MOTOR_L_A) | BIT64(PIN_MOTOR_L_B) | \
 	BIT64(PIN_MOTOR_R_A) | BIT64(PIN_MOTOR_R_B) | \
 	BIT64(PIN_ENC_L_A) | BIT64(PIN_ENC_L_B) | BIT64(PIN_ENC_R_A) | \
@@ -176,7 +213,7 @@
 	BIT64(PIN_US_TRIG) | BIT64(PIN_US_ECHO) | BIT64(PIN_SERVO) | \
 	BIT64(PIN_ALERT_LED) | BIT64(PIN_STATUS_LED) | BIT64(PIN_BTN_START) | \
 	BIT64(PIN_BTN_STOP) | BIT64(PIN_BUZZER) | BIT64(PIN_BARCODE) | \
-	BIT64(PIN_IMU_INT) | BIT64(PIN_IMU_SDA) | BIT64(PIN_IMU_SCL) | BIT64(PIN_RGB))
+	BC_ADC_PIN_BIT | BIT64(PIN_IMU_SDA) | BIT64(PIN_IMU_SCL) | BIT64(PIN_RGB))
 #define RADIO_PINS	(BIT64(23) | BIT64(24) | BIT64(25) | BIT64(29))
 
 /* Sum == OR only if no pin appears twice */
@@ -187,6 +224,8 @@ CC_ASSERT(USED_PINS_OR < BIT64(30), "GPIO number out of range");
 /* Analog inputs must be ADC pins */
 CC_ASSERT(PIN_LINE_L >= 26 && PIN_LINE_L <= 28, "left line sensor needs an ADC pin");
 CC_ASSERT(PIN_LINE_R >= 26 && PIN_LINE_R <= 28, "right line sensor needs an ADC pin");
+CC_ASSERT(!BARCODE_ANALOG || (PIN_BARCODE_ADC >= 26 && PIN_BARCODE_ADC <= 28),
+	  "barcode A0 needs an ADC pin (GP26..28)");
 
 /* PWM pins sit on the slices we claim (slice = (pin >> 1) & 7) */
 #define PWM_SLICE_OF(p)		(((p) >> 1) & 7)
