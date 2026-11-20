@@ -56,7 +56,7 @@ EXPORT void resources_report(void)
 		  "  imu %d/1  barcode %d/0  comms %d/0  status %d/0\n",
 		  PRI_MOTION, PRI_MISSION, PRI_LINE, PRI_RANGER, PRI_IMU, PRI_BARCODE, PRI_COMMS, PRI_STATUS);
 	tm_printf((UB*)"  PWM slices: 0 = ultrasonic echo, 4 = left motor, 5 = right motor, 6 = servo, 3 = buzzer; PIO0 SM3 = RGB LEDs (radio uses PIO1)\n");
-#if BARCODE_ANALOG
+#if BARCODE_READ_A0
 	tm_printf((UB*)"  ADC scan (FIFO IRQ 22, core 0): GP%d GP%d = line sensors, GP%d = barcode A0   I2C0 = IMU (imu task)\n",
 		  PIN_LINE_L, PIN_LINE_R, PIN_BARCODE_ADC);
 	tm_printf((UB*)"  GPIO IRQ 13: shared dispatcher (encoders GP%d GP%d GP%d GP%d)\n",

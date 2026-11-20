@@ -189,7 +189,7 @@ LOCAL void adc_isr(UINT intno)
    already fell back to single reads. */
 EXPORT BOOL adc_scan_start(void)
 {
-#if BARCODE_ANALOG
+#if BARCODE_READ_A0
 	T_DINT dint;
 	UINT c, total;
 
@@ -252,7 +252,7 @@ LOCAL void line_task(INT stacd, void *exinf)
 	UINT i;
 
 	(void)stacd; (void)exinf;
-#if BARCODE_ANALOG
+#if BARCODE_READ_A0
 	/* the barcode task (core 0) starts the ADC scan; never touch the ADC
 	   registers while it may be doing so.  Give it 2 s, then fall back. */
 	for (i = 0; i < 200 && !adc_scan_on; i++) tk_dly_tsk(10);

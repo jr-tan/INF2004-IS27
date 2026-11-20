@@ -47,6 +47,12 @@
          IMU INT: unplugged (the IMU is polled over I2C)
    Flash the matching build straight after changing the wires. */
 #define BARCODE_ANALOG		1
+/* 20 Nov: how the barcode is READ (the wiring above stays the same):
+     1 = analog A0 on GP28 (needs BARCODE_ANALOG 1)
+     0 = digital D0 on PIN_BARCODE with the 10 ms noise filter: GP7
+         (Grove 7 white) on the plug-swap wiring, GP2 on the old wiring.
+         No rewiring needed to switch between 0 and 1 on the plug swap. */
+#define BARCODE_READ_A0		0
 /* Wheel encoders (quadrature, inside the motors) */
 #if BARCODE_ANALOG
 #define PIN_ENC_L_A		2	/* Grove 2 white (encoder cable moved to Grove 2) */
@@ -226,6 +232,8 @@ CC_ASSERT(PIN_LINE_L >= 26 && PIN_LINE_L <= 28, "left line sensor needs an ADC p
 CC_ASSERT(PIN_LINE_R >= 26 && PIN_LINE_R <= 28, "right line sensor needs an ADC pin");
 CC_ASSERT(!BARCODE_ANALOG || (PIN_BARCODE_ADC >= 26 && PIN_BARCODE_ADC <= 28),
 	  "barcode A0 needs an ADC pin (GP26..28)");
+CC_ASSERT(!BARCODE_READ_A0 || BARCODE_ANALOG,
+	  "BARCODE_READ_A0 1 needs the analog wiring (BARCODE_ANALOG 1)");
 
 /* PWM pins sit on the slices we claim (slice = (pin >> 1) & 7) */
 #define PWM_SLICE_OF(p)		(((p) >> 1) & 7)

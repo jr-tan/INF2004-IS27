@@ -227,7 +227,7 @@ LOCAL UW  d_changes, d_bars, d_clean;	/* BC_DIAG counters */
 
 LOCAL UB pin_black(void)
 {
-	if (BARCODE_ANALOG) return a_black;
+	if (BARCODE_READ_A0) return a_black;
 	return ((gpio_get_val(PIN_BARCODE) != 0) == (BARCODE_BLACK_IS_HIGH != 0)) ? 1U : 0U;
 }
 
@@ -291,7 +291,7 @@ LOCAL void barcode_task(INT stacd, void *exinf)
 	(void)stacd; (void)exinf;
 	gpio_set_pin(PIN_BARCODE, GPIO_MODE_IN);
 	db_level = pin_black();
-#if BARCODE_ANALOG
+#if BARCODE_READ_A0
 	a_min = 4095; a_max = 0;
 	if (adc_scan_start())
 		tm_printf((UB*)"BARCODE analog A0 on GP%d (ADC scan 1000/s per pin, filter %d ms)\n",
@@ -309,7 +309,7 @@ LOCAL void barcode_task(INT stacd, void *exinf)
 #endif
 #if BC_DIAG
 	tm_printf((UB*)"BARCODE sensor on GP%d reads %s now (filter %d ms)\n",
-		  BARCODE_ANALOG ? PIN_BARCODE_ADC : PIN_BARCODE,
+		  BARCODE_READ_A0 ? PIN_BARCODE_ADC : PIN_BARCODE,
 		  pin_black() ? "BLACK" : "WHITE", (INT)(BC_DEBOUNCE_US / 1000U));
 	d_t = now_ms();
 #endif
@@ -354,7 +354,7 @@ LOCAL void barcode_task(INT stacd, void *exinf)
 				tm_printf((UB*)"BARCODE sensor: %d raw changes (%d black) -> %d real after filtering, in %d ms, now %s\n",
 					  (INT)d_changes, (INT)d_bars, (INT)d_clean, (INT)(now_ms() - d_t),
 					  pin_black() ? "BLACK" : "WHITE");
-#if BARCODE_ANALOG
+#if BARCODE_READ_A0
 			{	/* A0 range this second; printed when it moved, or every 5 s */
 				static UINT quiet;
 				UINT mn = a_min, mx = a_max;
