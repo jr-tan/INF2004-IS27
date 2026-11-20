@@ -22,10 +22,11 @@
    2 Nov circuit log: 25.5 % duty = 140 mm/s on the mat */
 #define MOT_D0_PM		120		/* duty where the wheels start to turn */
 #define MOT_K_PM_X1000		986		/* + duty per mm/s, x1000 */
-/* 20 Nov: was 1150 ("left motor ~15 % weaker").  With the wheels in the
-   air the left one ran FASTER, and at 30 mm/s the +15 % cancelled every
-   left steer (left 15 mm/s got more duty than right 30 mm/s). */
-#define MOT_GAIN_L_X1000	1000
+/* CAL: left motor is ~15 % weaker.  20 Nov: kept at 1150 because the
+   12 Nov afternoon build (MOT_CLASSIC) with 1150 followed best.  Test 1000
+   if the car drifts right on straights: wheels in the air the left one
+   ran faster, and at 30 mm/s the +15 % weakens left steers. */
+#define MOT_GAIN_L_X1000	1150
 #define MOT_GAIN_R_X1000	1000
 #define MOT_MAX_MMS		600
 
@@ -66,6 +67,7 @@
 #define TRIM_MAX_PM		300		/* never more than +-30 % duty (was 15 %:
 						   not enough to hold speed up a slope) */
 #define TRIM_MIN_MMS		15		/* learns from this speed up (was 40) */
+#define CLASSIC_TRIM_MAX_PM	150		/* MOT_CLASSIC: +-15 % as on 12 Nov afternoon */
 
 /* ---- stall boost (12 Nov evening): driven, no encoder steps for
    STALL_MS -> add STALL_BOOST_STEP_PM per 20 ms tick, up to

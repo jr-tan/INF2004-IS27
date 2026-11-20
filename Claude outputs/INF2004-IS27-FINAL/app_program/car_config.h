@@ -31,6 +31,16 @@
 #define PIN_MOTOR_R_B		11	/* M2B  PWM slice 5 B */
 #define MOTOR_L_INVERT		0	/* 1 = swap A/B in software */
 #define MOTOR_R_INVERT		1	/* right motor is mounted mirrored */
+/* 20 Nov: 1 = drive like the 12 Nov afternoon build (IS27_edge_avoid),
+   which followed the line more consistently on this car:
+     - no stall boost
+     - encoder trim only with both wheels healthy, both >= 40 mm/s, not
+       pivoting, at most +-15 % (so never at line speed)
+     - an encoder silent for 0.2 s while driven = unhealthy (as before)
+     - no automatic climb mode (70 mm/s on a ramp / stalled wheel)
+   0 = the 12 Nov evening motion (stall boost, per-wheel trim from
+   15 mm/s, climb mode for ramps). */
+#define MOT_CLASSIC		1
 
 /* 16 Nov: read the barcode sensor's A0 (analog) instead of D0.  The ADC
    scans GP26/27/28 continuously (1000 samples a second each); barcode.c

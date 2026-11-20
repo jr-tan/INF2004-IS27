@@ -314,6 +314,7 @@ LOCAL BOOL climb_step(UW t)
 	IMU_STATUS im;
 	BOOL tilt, stalled;
 
+	if (MOT_CLASSIC) return FALSE;		/* 20 Nov: no automatic climb mode */
 	imu_get(&im);
 	/* nose UP or sideways: going down a slope needs no help */
 	tilt = im.ok && (im.pitch_d10 >= CLIMB_TILT_D10 || ABS(im.roll_d10) >= CLIMB_TILT_D10);

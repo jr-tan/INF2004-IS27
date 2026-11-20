@@ -198,7 +198,7 @@ LOCAL void motion_task(INT stacd, void *exinf)
 			   not turning (ramp, one-sided ramp, pivoting on one
 			   wheel at ~15 % duty) gets more duty, step by step,
 			   until it moves; the boost then fades out slowly */
-			if (healthy[m] && sp >= STALL_MIN_MMS &&
+			if (!MOT_CLASSIC && healthy[m] && sp >= STALL_MIN_MMS &&
 			    (t - start_us[m]) > MOT_KICK_MS * 1000U &&
 			    (t - es[m].last_us) > STALL_MS * 1000U) {
 				if (boost[m] < STALL_BOOST_MAX_PM) {
@@ -232,13 +232,14 @@ LOCAL void motion_task(INT stacd, void *exinf)
 		   thrown away and the car never got going again. */
 		BOOL fresh[2];
 		for (m = 0; m < 2; m++) {
-			BOOL driven = ABS(cur[m]) >= TRIM_MIN_MMS &&
+			BOOL driven = ABS(cur[m]) >= (MOT_CLASSIC ? ENC_MIN_MMS : TRIM_MIN_MMS) &&
 				      (t - start_us[m]) > (MOT_KICK_MS + ENC_DEAD_MS) * 1000U;
 			BOOL silent = (t - es[m].last_us) > ENC_DEAD_MS * 1000U;
 			fresh[m] = driven && !silent;
 			if (healthy[m]) {
-				if (driven && silent && boost[m] >= STALL_BOOST_MAX_PM &&
-				    (t - boost_max_t[m]) > STALL_GIVEUP_MS * 1000U) {
+				if (driven && silent && (MOT_CLASSIC ||
+				    (boost[m] >= STALL_BOOST_MAX_PM &&
+				     (t - boost_max_t[m]) > STALL_GIVEUP_MS * 1000U))) {
 					healthy[m] = FALSE;
 					trim[m] = 0;		/* learned from a dead wheel: forget it */
 					boost[m] = 0;
@@ -257,7 +258,22 @@ LOCAL void motion_task(INT stacd, void *exinf)
 		   motors were pure open loop at ~15 % duty: any slope stalled
 		   them.  Now each wheel learns from TRIM_MIN_MMS up. */
 		trim_on = FALSE;
-		if (MOT_TRIM_ON && n_hist == ENC_WINDOW_TICKS) {
+		if (MOT_CLASSIC) {
+			/* 12 Nov afternoon: learn only while both encoders are
+			   believable, both wheels >= ENC_MIN_MMS, not pivoting */
+			trim_on = MOT_TRIM_ON && healthy[0] && healthy[1] && fresh[0] && fresh[1] &&
+				  n_hist == ENC_WINDOW_TICKS &&
+				  ABS(cur[0]) >= ENC_MIN_MMS && ABS(cur[1]) >= ENC_MIN_MMS &&
+				  ABS(cur[0] - tgt[0]) <= 20 && ABS(cur[1] - tgt[1]) <= 20 &&
+				  (cur[0] > 0) == (cur[1] > 0);
+			if (trim_on) {
+				for (m = 0; m < 2; m++) {
+					INT err = ABS(cur[m]) - v[m];
+					trim[m] += (err * TRIM_KI_X1000) / 1000;
+					trim[m] = CLAMP(trim[m], -CLASSIC_TRIM_MAX_PM, CLASSIC_TRIM_MAX_PM);
+				}
+			}
+		} else if (MOT_TRIM_ON && n_hist == ENC_WINDOW_TICKS) {
 			for (m = 0; m < 2; m++) {
 				INT err;
 				if (!healthy[m] || !fresh[m] || boost[m] != 0 ||
