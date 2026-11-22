@@ -1,0 +1,91 @@
+--- mqtt_utk.orig.c	2026-11-12 18:14:44.531159660 +0800
++++ mqtt_utk.c	2026-11-12 18:15:40.267779899 +0800
+@@ -26,6 +26,7 @@
+  *	file's size_t workaround -- tm/tmonitor.h alone is namespace-safe here.
+  */
+ 
++#include <string.h>
+ #include "lwip/apps/mqtt.h"
+ #include "lwip/ip_addr.h"
+ #include "lwip/timeouts.h"
+@@ -65,7 +66,7 @@
+ 	{ MQTT_TOPIC_ROOT "/tlm/motion",   0, 0 },	/* COMMS_TOPIC_TLM_MOTION   */
+ 	{ MQTT_TOPIC_ROOT "/tlm/line",     0, 0 },	/* COMMS_TOPIC_TLM_LINE     */
+ 	{ MQTT_TOPIC_ROOT "/tlm/terrain",  0, 0 },	/* COMMS_TOPIC_TLM_TERRAIN  */
+-	{ MQTT_TOPIC_ROOT "/tlm/obstacle", 0, 0 },	/* COMMS_TOPIC_TLM_OBSTACLE */
++	{ MQTT_TOPIC_ROOT "/tlm/obstacle", 1, 0 },	/* COMMS_TOPIC_TLM_OBSTACLE (QoS 1: one-off steps) */
+ 	{ MQTT_TOPIC_ROOT "/status",       0, 1 },	/* COMMS_TOPIC_STATUS (retained) */
+ 	{ MQTT_TOPIC_ROOT "/event/fault",  1, 0 },	/* COMMS_TOPIC_FAULT (QoS 1) */
+ 	{ MQTT_TOPIC_ROOT "/tlm/resources", 0, 0 },	/* COMMS_TOPIC_RESOURCES    */
+@@ -155,6 +156,14 @@
+  * it publishes queued frames.  While NOT connected it discards them: stale
+  * telemetry is worthless and must not pile up or fire in a burst after the
+  * link returns (the next status frame carries the latest state). */
++/* 12 Nov: a QoS 1 frame (obstacle step, fault) that mqtt_publish() could
++ * not take (ERR_MEM: output buffer or in-flight slots full during a WiFi
++ * stall) is kept here and tried again on the next pump, instead of being
++ * lost.  One slot is enough: these frames are rare. */
++static u8_t	retry_frame[COMMS_FRAME_MAX];
++static u16_t	retry_len;
++static u8_t	retry_topic;
++
+ static void pump_timeout(void *arg)
+ {
+ 	u8_t	topic;
+@@ -167,6 +176,18 @@
+ 
+ 	connected = (client != NULL) && mqtt_client_is_connected(client);
+ 
++	if(retry_len != 0) {
++		if(!connected) {
++			retry_len = 0;		/* stale after a reconnect: drop it */
++			comms_port_publish_result(0);
++		} else if(mqtt_publish(client, topic_tab[retry_topic].name, retry_frame, retry_len,
++				       topic_tab[retry_topic].qos, topic_tab[retry_topic].retain,
++				       NULL, NULL) == ERR_OK) {
++			retry_len = 0;
++			comms_port_publish_result(1);
++		}
++	}
++
+ 	for(burst = 0; burst < COMMS_PUMP_BURST; burst++) {
+ 		len = comms_port_tx_pop(&topic, frame, (u16_t)sizeof(frame));
+ 		if(len == 0) {
+@@ -187,7 +208,13 @@
+ 			err_t err = mqtt_publish(client, topic_tab[topic].name, frame, len,
+ 						 topic_tab[topic].qos, topic_tab[topic].retain,
+ 						 NULL, NULL);
+-			comms_port_publish_result((err == ERR_OK)? 1: 0);
++			if((err != ERR_OK) && (topic_tab[topic].qos != 0) && (retry_len == 0)) {
++				MEMCPY(retry_frame, frame, len);	/* try again next pump */
++				retry_len = len;
++				retry_topic = topic;
++			} else {
++				comms_port_publish_result((err == ERR_OK)? 1: 0);
++			}
+ #if COMMS_DEBUG
+ 			if(err == ERR_OK) {
+ 				tm_printf((UB*)"mqtt: TX %s (%d bytes)\n",
+--- lwipopts.orig.h	2026-11-12 18:14:44.532590213 +0800
++++ lwipopts.h	2026-11-12 18:15:40.268336598 +0800
+@@ -39,7 +39,7 @@
+ 
+ #define MEM_LIBC_MALLOC             0
+ #define MEM_ALIGNMENT               4
+-#define MEM_SIZE                    (16 * 1024)
++#define MEM_SIZE                    (17 * 1024)	/* 12 Nov: +1 KB for the larger MQTT buffer below (the client is allocated from this heap) */
+ 
+ #define MEMP_NUM_TCP_SEG            32
+ #define MEMP_NUM_ARP_QUEUE          10
+@@ -62,6 +62,11 @@
+ 
+ #define TCP_MSS                     1460
+ #define TCP_WND                     (8 * TCP_MSS)
++/* 12 Nov: lwIP MQTT keeps unsent publishes in this buffer (default 256
++   bytes, ~7 frames).  On the phone hotspot a short WiFi stall filled it
++   and later frames were refused (lost status/telemetry, gaps in the GUI).
++   1 KB holds ~1.5 s of telemetry. */
++#define MQTT_OUTPUT_RINGBUF_SIZE    1024
+ #define TCP_SND_BUF                 (8 * TCP_MSS)
+ #define TCP_SND_QUEUELEN            ((4 * (TCP_SND_BUF) + (TCP_MSS - 1)) / (TCP_MSS))
+ 

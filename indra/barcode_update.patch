@@ -1,0 +1,939 @@
+From 7162c9c12da83ec7e144430fcd109b68ba3dba4d Mon Sep 17 00:00:00 2001
+From: IS27 Buddy 1 <is27@users.noreply.github.com>
+Date: Mon, 16 Nov 2026 16:08:18 +0800
+Subject: [PATCH] Barcode: GUI-set letter map, noise filter, sensor diagnostics
+
+- GUI "Barcode map" box (e.g. A=L B=R C=U D=S) publishes robot/map
+  (QoS 1, retained); the car confirms the map in use on robot/tlm/map
+  every 5 s. Unmapped letters drive straight; built-in default is all
+  straight. START works with or without a map.
+- barcode.c: 10 ms debounce on the sensor's D0 (comparator chatter gave
+  300-600 changes/s), end-of-barcode wait raised to 0.8 s, console
+  diagnostics (per-change log, per-second counts, reasons for rejects).
+- comms_frames / codec: map and map-ack frames, covered by
+  testing/comms_test (C packer vs Python decoder).
+
+Co-Authored-By: Claude Opus 5.5 <noreply@anthropic.com>
+Claude-Session: https://claude.ai/code/session_0146ZJZmHJ22aECQtBcDQi4o
+---
+ .../INF2004-IS27-FINAL/app_program/car.h      |   5 +
+ .../app_program/car_config.h                  |  13 +-
+ .../app_program/subsystem1/comms_frames.c     |  22 +++
+ .../app_program/subsystem1/comms_frames.h     |  14 ++
+ .../app_program/subsystem1/comms_port.h       |   6 +-
+ .../app_program/subsystem1/subsystem1.c       |  43 ++++-
+ .../app_program/subsystem3/barcode.c          | 175 +++++++++++++++---
+ .../liblwip/sysdepend/pico_rp2040/mqtt_utk.c  |  38 +++-
+ .../testing/comms_test/frames_dump.c          |  15 ++
+ .../testing/comms_test/test_frames.py         |  17 +-
+ .../tools/comms/README_GUI.md                 |  21 +++
+ .../tools/comms/comms_codec.py                |  63 ++++++-
+ .../tools/comms/is27_gui.py                   |  68 ++++++-
+ 13 files changed, 457 insertions(+), 43 deletions(-)
+
+diff --git a/Claude outputs/INF2004-IS27-FINAL/app_program/car.h b/Claude outputs/INF2004-IS27-FINAL/app_program/car.h
+index edf0672..cc6a821 100644
+--- a/Claude outputs/INF2004-IS27-FINAL/app_program/car.h	
++++ b/Claude outputs/INF2004-IS27-FINAL/app_program/car.h	
+@@ -162,6 +162,11 @@ typedef struct {
+ } BARCODE_INFO;
+ IMPORT void barcode_get(BARCODE_INFO *b);
+ IMPORT BOOL barcode_busy(void);		/* bars passing right now (or just did) */
++#define BC_MAP_LETTERS		26	/* A..Z */
++/* letter -> BC_ACT_* map, set from the GUI (robot/map).  Called by the
++   comms task only.  get returns TRUE once a map has come from the GUI. */
++IMPORT void barcode_set_map(const UB act[BC_MAP_LETTERS]);
++IMPORT BOOL barcode_get_map(UB act[BC_MAP_LETTERS]);
+ 
+ /* ---------------------------------------------------------------------
+  *  IMU (subsystem4, GY-511 = LSM303 accel + magnetometer, no gyro)
+diff --git a/Claude outputs/INF2004-IS27-FINAL/app_program/car_config.h b/Claude outputs/INF2004-IS27-FINAL/app_program/car_config.h
+index d56cce7..ba484a0 100644
+--- a/Claude outputs/INF2004-IS27-FINAL/app_program/car_config.h	
++++ b/Claude outputs/INF2004-IS27-FINAL/app_program/car_config.h	
+@@ -75,13 +75,16 @@
+ /* Barcode + IMU */
+ #define PIN_BARCODE		2	/* Grove 2, barcode sensor D0 (edges via gpio_irq) */
+ #define BARCODE_BLACK_IS_HIGH	1	/* 0 if D0 reads LOW on black */
+-/* DEMO DAY: what each letter does, one character per letter A..Z
+-   (lower case letters act like upper case):
++/* Barcode letter -> action.  The GUI sets this over MQTT ("Barcode map"
++   box, e.g. A=L B=R C=U D=S); this is only what the car uses from boot
++   until the GUI's map arrives, or with no WiFi at all.  One character per
++   letter A..Z (lower case letters act like upper case):
+      L = turn left at the next junction    R = turn right
+      U = U-turn                            S = stop (end of course)
+-     - = just report it
+-   e.g. A = left, B = right, C = U-turn, D = stop, rest report only: */
+-#define BC_ACTION_MAP		"LRUS----------------------"
++     - = drive straight on (report only)
++   Default: all straight.  For a demo without WiFi put letters back,
++   e.g. "LRUS----------------------" = A left, B right, C U-turn, D stop. */
++#define BC_ACTION_MAP		"--------------------------"
+ /*                             ABCDEFGHIJKLMNOPQRSTUVWXYZ */
+ #define PIN_IMU_INT		3	/* Grove 2, GY-511 INT1: claimed, IMU is polled */
+ #define PIN_IMU_SDA		4	/* Grove 3, I2C0 SDA */
+diff --git a/Claude outputs/INF2004-IS27-FINAL/app_program/subsystem1/comms_frames.c b/Claude outputs/INF2004-IS27-FINAL/app_program/subsystem1/comms_frames.c
+index cb00dda..ff478a5 100644
+--- a/Claude outputs/INF2004-IS27-FINAL/app_program/subsystem1/comms_frames.c	
++++ b/Claude outputs/INF2004-IS27-FINAL/app_program/subsystem1/comms_frames.c	
+@@ -162,3 +162,25 @@ uint32_t fr_cmd_decode(const uint8_t *b, uint32_t len, uint32_t *id)
+ 	*id = (uint32_t)b[0] >> 3;
+ 	return (code >= 1 && code <= 7) ? code : 0;
+ }
++
++uint32_t fr_map_decode(const uint8_t *b, uint32_t len, uint8_t *act)
++{
++	uint32_t i;
++	if (len != FR_MAP_BYTES) return 0;
++	for (i = 0; i < FR_MAP_LETTERS; i++) {
++		if (bits_get(b, i * 3U, 3U) > FR_MAP_ACT_MAX) return 0;
++	}
++	for (i = 0; i < FR_MAP_LETTERS; i++) act[i] = (uint8_t)bits_get(b, i * 3U, 3U);
++	return 1;
++}
++
++uint32_t fr_map_ack(uint8_t *b, const uint8_t *act, uint32_t received)
++{
++	uint32_t i;
++	zero(b, FR_MAP_ACK_BYTES);
++	for (i = 0; i < FR_MAP_LETTERS; i++) {
++		bits_put(b, i * 3U, 3U, act[i] > FR_MAP_ACT_MAX ? 0U : act[i]);
++	}
++	b[FR_MAP_BYTES] = (uint8_t)(received ? 1U : 0U);
++	return FR_MAP_ACK_BYTES;
++}
+diff --git a/Claude outputs/INF2004-IS27-FINAL/app_program/subsystem1/comms_frames.h b/Claude outputs/INF2004-IS27-FINAL/app_program/subsystem1/comms_frames.h
+index 133e89e..df8f0f8 100644
+--- a/Claude outputs/INF2004-IS27-FINAL/app_program/subsystem1/comms_frames.h	
++++ b/Claude outputs/INF2004-IS27-FINAL/app_program/subsystem1/comms_frames.h	
+@@ -29,6 +29,10 @@
+  *	                   mbfs max 4, cycs 4, cycs max 4, out-queue fill % 7,
+  *	                   tx drops 8, motion loop us 12, line loop us 12     15
+  *	robot/cmd codes: 1 START 2 STOP 3 PAUSE 4 RESUME 5 PING 6 U-TURN 7 REVERSE
++ *	robot/map (in,     26 x action 3 (letter A first), pad 2            10
++ *	  GUI, retained)   action: 0 straight 1 left 2 right 3 U-turn 4 stop
++ *	robot/tlm/map      the map the car is using (same 10 bytes),
++ *	                   then flags 8 (bit 0 = a map arrived since boot)   11
+  *
+  *	The status / fault / cmd layouts are the team's (docs/buddy1_comms.md),
+  *	so the existing dashboard still decodes them.
+@@ -48,6 +52,10 @@
+ #define FR_TERRAIN_BYTES	7
+ #define FR_OBSTACLE_BYTES	8
+ #define FR_RESOURCES_BYTES	15
++#define FR_MAP_BYTES		10
++#define FR_MAP_ACK_BYTES	11
++#define FR_MAP_LETTERS		26
++#define FR_MAP_ACT_MAX		4	/* = BC_ACT_END */
+ 
+ /* system mode on the wire (team's SYS_MODES list) */
+ #define SYS_INIT		0
+@@ -93,4 +101,10 @@ uint32_t fr_resources(uint8_t *b, uint32_t t_ms, const FR_RES *r);
+ /* robot/cmd: returns code (1..7) or 0 if invalid; *id = 0..31 */
+ uint32_t fr_cmd_decode(const uint8_t *b, uint32_t len, uint32_t *id);
+ 
++/* robot/map: fills act[26] and returns 1 if b is exactly FR_MAP_BYTES
++   with every action 0..FR_MAP_ACT_MAX; else 0 and act is untouched. */
++uint32_t fr_map_decode(const uint8_t *b, uint32_t len, uint8_t *act);
++/* robot/tlm/map: the map in use + flags (bit 0 = received) */
++uint32_t fr_map_ack(uint8_t *b, const uint8_t *act, uint32_t received);
++
+ #endif
+diff --git a/Claude outputs/INF2004-IS27-FINAL/app_program/subsystem1/comms_port.h b/Claude outputs/INF2004-IS27-FINAL/app_program/subsystem1/comms_port.h
+index 3b64849..0b881cb 100644
+--- a/Claude outputs/INF2004-IS27-FINAL/app_program/subsystem1/comms_port.h	
++++ b/Claude outputs/INF2004-IS27-FINAL/app_program/subsystem1/comms_port.h	
+@@ -25,11 +25,13 @@ typedef enum {
+ 	COMMS_TOPIC_STATUS       = 4,	/* robot/status (retained) */
+ 	COMMS_TOPIC_FAULT        = 5,	/* robot/event/fault (QoS 1) */
+ 	COMMS_TOPIC_RESOURCES    = 6,	/* robot/tlm/resources */
+-	COMMS_TOPIC_COUNT        = 7
++	COMMS_TOPIC_MAP_ACK      = 7,	/* robot/tlm/map (barcode map in use) */
++	COMMS_TOPIC_COUNT        = 8
+ } comms_topic_t;
+ 
+ #define COMMS_FRAME_MAX		(16U)	/* largest payload, bytes (resources = 15) */
+-#define COMMS_RX_MAX		(8U)	/* largest inbound command */
++#define COMMS_RX_MAX		(12U)	/* largest inbound: marker + 10-byte map */
++#define COMMS_RX_MAP_MARK	(0xFFU)	/* rx[0] of a robot/map payload (never a valid cmd) */
+ 
+ uint16_t comms_port_tx_pop(uint8_t *topic, uint8_t *frame, uint16_t cap);
+ void comms_port_rx_push(const uint8_t *frame, uint16_t len);
+diff --git a/Claude outputs/INF2004-IS27-FINAL/app_program/subsystem1/subsystem1.c b/Claude outputs/INF2004-IS27-FINAL/app_program/subsystem1/subsystem1.c
+index c8e8fd0..40cda4d 100644
+--- a/Claude outputs/INF2004-IS27-FINAL/app_program/subsystem1/subsystem1.c	
++++ b/Claude outputs/INF2004-IS27-FINAL/app_program/subsystem1/subsystem1.c	
+@@ -125,10 +125,42 @@ LOCAL void send_resources(void)
+ 	publish(COMMS_TOPIC_RESOURCES, f, FR_RESOURCES_BYTES);
+ }
+ 
++/* robot/tlm/map: the barcode map the car is really using, so the GUI
++   can show it was received.  Sent on a new map, on (re)connect and every
++   MAP_ACK_S seconds. */
++#define MAP_ACK_S	5U
++LOCAL void send_map_ack(void)
++{
++	UB f[COMMS_FRAME_MAX], act[BC_MAP_LETTERS];
++	BOOL got = barcode_get_map(act);
++	fr_map_ack(f, act, got ? 1U : 0U);
++	publish(COMMS_TOPIC_MAP_ACK, f, FR_MAP_ACK_BYTES);
++}
++
++LOCAL void on_map(const UB *b, UINT len)
++{
++	static const char letter[] = "-LRUS";
++	UB act[BC_MAP_LETTERS];
++	UINT i, k = 0;
++
++	if (!fr_map_decode(b, len, act)) {
++		tm_printf((UB*)"COMMS barcode map rejected (%d bytes, need %d)\n", (INT)len, FR_MAP_BYTES);
++		return;
++	}
++	barcode_set_map(act);
++	tm_printf((UB*)"COMMS barcode map from GUI:");
++	for (i = 0; i < BC_MAP_LETTERS; i++) {
++		if (act[i] != BC_ACT_NONE) { tm_printf((UB*)" %c=%c", (INT)('A' + i), (INT)letter[act[i]]); k++; }
++	}
++	tm_printf((UB*)"%s\n", k ? " (rest straight)" : " all straight");
++	send_map_ack();
++}
++
+ /* ===================== comms task ===================== */
+ LOCAL void comms_task(INT stacd, void *exinf)
+ {
+ 	UINT tick = 0, seq = 0, last_faults = 0, last_obs = 0, last_bc = 0;
++	BOOL mqtt_was_up = FALSE;
+ 	UB f[COMMS_FRAME_MAX], rx[COMMS_RX_MAX];
+ #if TM_NET_LWIP
+ 	T_CYW43_UTK_STATUS ws;
+@@ -148,6 +180,10 @@ LOCAL void comms_task(INT stacd, void *exinf)
+ 			int32_t mms, bend, kp, pivot;
+ 			UINT code = fr_cmd_decode(rx, (UW)n, &id);
+ 			rx_cmds++;
++			if (n >= 1 && rx[0] == COMMS_RX_MAP_MARK) {	/* robot/map */
++				on_map(&rx[1], (UINT)n - 1U);
++				continue;
++			}
+ 			if (fr_cmd_tune(rx, (UW)n, &mms, &bend, &kp, &pivot)) {
+ 				line_set_tuning((INT)mms, (INT)bend, (INT)kp);
+ 				if (pivot == 1 || pivot == 2) line_set_pivot(pivot == 2);
+@@ -210,6 +246,11 @@ LOCAL void comms_task(INT stacd, void *exinf)
+ 		}
+ 		(void)last_obs;
+ 
++		/* barcode map in use: on connect, then every MAP_ACK_S */
++		if (mqtt_up && (!mqtt_was_up || (tick % (MAP_ACK_S * 1000U / COMMS_PERIOD_MS)) == 7))
++			send_map_ack();
++		mqtt_was_up = mqtt_up;
++
+ 		/* resource usage, once a second */
+ 		if ((tick % (1000 / COMMS_PERIOD_MS)) == 3) send_resources();
+ 		barcode_get(&bc);
+@@ -346,7 +387,7 @@ EXPORT ER subsystem1_init(void)
+ 	cmbf.bufsz  = PUB_BUFSZ;		/* ~24 frames queued */
+ 	cmbf.maxmsz = 1 + COMMS_FRAME_MAX;
+ 	if ((mbf_pub = tk_cre_mbf(&cmbf)) < E_OK) return mbf_pub;
+-	cmbf.bufsz  = 8 * 12;
++	cmbf.bufsz  = 8 * (COMMS_RX_MAX + 4U);
+ 	cmbf.maxmsz = COMMS_RX_MAX;
+ 	if ((mbf_rx = tk_cre_mbf(&cmbf)) < E_OK) return mbf_rx;
+ 	return E_OK;
+diff --git a/Claude outputs/INF2004-IS27-FINAL/app_program/subsystem3/barcode.c b/Claude outputs/INF2004-IS27-FINAL/app_program/subsystem3/barcode.c
+index e1dbb3f..07c2b48 100644
+--- a/Claude outputs/INF2004-IS27-FINAL/app_program/subsystem3/barcode.c	
++++ b/Claude outputs/INF2004-IS27-FINAL/app_program/subsystem3/barcode.c	
+@@ -27,7 +27,12 @@
+ #define BC_RING			128	/* power of two */
+ #define BC_MAX_EDGES		(10 * 10)	/* up to 10 characters incl. the two '*' */
+ #define BC_MIN_EL_US		300	/* shorter = noise */
+-#define BC_END_GAP_MS		40
++/* 16 Nov: was 40.  The frame ended after 2 x the widest element so far,
++   which right after the start (widest = one space) cut the barcode off
++   whenever the car or a hand slowed down for one narrow space (bench log:
++   bar 123, space 205, bar 121 ms, then given up).  A barcode is followed
++   by a white quiet zone of 10 narrow widths, so waiting 0.8 s is safe. */
++#define BC_END_GAP_MS		800
+ /* 12 Nov: sized for line speeds down to 25 mm/s.  Before the timer fix
+    (kernel cpu_clock.c) every ms here was really ~43 ms, so the old
+    400 / 2500 never limited anything.  At 30 mm/s a 9 mm wide bar takes
+@@ -41,6 +46,19 @@
+ #define BC_MAX_FRAME_MS		16000
+ #define BC_RATIO_X10		15	/* wide must be >= 1.5 x narrow */
+ #define BC_BUSY_HOLD_MS		400	/* "busy" this long after the last edge */
++/* 16 Nov: sensor check on the console.  1 = once a second, if the sensor
++   changed at all: how many black/white changes and black bars it saw;
++   and a line for every barcode attempt that is thrown away, with why.
++   Set 0 once the barcodes read reliably. */
++#define BC_DIAG			1
++#define BC_DIAG_MS		1000
++/* 16 Nov: the sensor's comparator chatters near its threshold (bench log:
++   300-600 changes a second, a barcode has ~30).  A change only counts once
++   the sensor has held the new colour this long; a burst of chatter becomes
++   one edge in the middle of the burst, a burst that ends on the old colour
++   is dropped.  10 ms is still under half the narrowest bar at 250 mm/s
++   (5 mm bar = 20 ms). */
++#define BC_DEBOUNCE_US		10000U
+ 
+ typedef struct { UW t; UB black; } EDGE;
+ 
+@@ -71,21 +89,52 @@ LOCAL void bc_isr(UINT gpio, UINT events, UW t)
+ 	if (bc_tid > 0) tk_wup_tsk(bc_tid);
+ }
+ 
+-/* letter -> action from BC_ACTION_MAP (car_config.h, set on demo day) */
++/* letter -> action.  The map lives in RAM so the GUI can set it over
++   MQTT (robot/map, retained: the car gets it again on every reconnect).
++   Until a map arrives it is BC_ACTION_MAP from car_config.h.  Letters the
++   map doesn't name, digits and symbols all mean BC_ACT_NONE: drive straight
++   on.  Only the comms task writes (barcode_set_map); the barcode task reads
++   one byte per decode, and a byte store is atomic, so no lock is needed. */
++LOCAL volatile UB act_map[BC_MAP_LETTERS];
++LOCAL volatile BOOL map_from_gui;
++LOCAL volatile BOOL map_ready;
++
++LOCAL void map_boot_default(void)
++{
++	static const char def[] = BC_ACTION_MAP;
++	UINT i;
++	for (i = 0; i < BC_MAP_LETTERS; i++) {
++		char m = (i < sizeof def - 1U) ? def[i] : '-';
++		act_map[i] = (UB)(m == 'L' ? BC_ACT_LEFT : m == 'R' ? BC_ACT_RIGHT :
++				  m == 'U' ? BC_ACT_UTURN : m == 'S' ? BC_ACT_END : BC_ACT_NONE);
++	}
++	map_ready = TRUE;
++}
++
++EXPORT void barcode_set_map(const UB act[BC_MAP_LETTERS])
++{
++	UINT i;
++	if (!map_ready) map_boot_default();
++	for (i = 0; i < BC_MAP_LETTERS; i++)
++		act_map[i] = (act[i] <= BC_ACT_END) ? act[i] : (UB)BC_ACT_NONE;
++	map_from_gui = TRUE;
++}
++
++EXPORT BOOL barcode_get_map(UB act[BC_MAP_LETTERS])
++{
++	UINT i;
++	if (!map_ready) map_boot_default();
++	for (i = 0; i < BC_MAP_LETTERS; i++) act[i] = act_map[i];
++	return map_from_gui;
++}
++
+ LOCAL UINT action_of(char c)
+ {
+-	static const char map[] = BC_ACTION_MAP;
+ 	if (c >= 'a' && c <= 'z') c = (char)(c - 'a' + 'A');
+-	if (c < 'A' || c > 'Z' || (UINT)(c - 'A') >= sizeof map - 1U) return BC_ACT_NONE;
+-	switch (map[c - 'A']) {
+-	case 'L': return BC_ACT_LEFT;
+-	case 'R': return BC_ACT_RIGHT;
+-	case 'U': return BC_ACT_UTURN;
+-	case 'S': return BC_ACT_END;
+-	default:  return BC_ACT_NONE;
+-	}
++	if (c < 'A' || c > 'Z') return BC_ACT_NONE;
++	return act_map[c - 'A'];
+ }
+-LOCAL const char *const act_name[] = { "report only", "LEFT at the next junction",
++LOCAL const char *const act_name[] = { "straight on (not mapped)", "LEFT at the next junction",
+ 	"RIGHT at the next junction", "U-TURN", "STOP (end of course)" };
+ 
+ LOCAL const char *err_text(INT e)
+@@ -100,6 +149,63 @@ LOCAL const char *err_text(INT e)
+ 	}
+ }
+ 
++/* ---- debounce: raw ISR edges -> clean edges ---- */
++LOCAL UB  db_level;			/* accepted colour, 1 = black */
++LOCAL BOOL db_pend;			/* a burst of raw edges is settling */
++LOCAL UW  db_t0, db_t1;			/* first / last raw edge of the burst */
++LOCAL UB  db_last;			/* colour read at the last raw edge */
++LOCAL UW  d_changes, d_bars, d_clean;	/* BC_DIAG counters */
++
++LOCAL UB pin_black(void)
++{
++	return ((gpio_get_val(PIN_BARCODE) != 0) == (BARCODE_BLACK_IS_HIGH != 0)) ? 1U : 0U;
++}
++
++LOCAL BOOL db_settle(UB level, EDGE *out)
++{
++	db_pend = FALSE;
++	if (level == db_level) return FALSE;	/* chatter that came back: nothing */
++	db_level = level;
++	out->t = db_t0 + (db_t1 - db_t0) / 2U;
++	out->black = level;
++	d_clean++;
++#if BC_DIAG
++	{	/* every real change, with how long the colour before it lasted */
++		static UW prev_t;
++		tm_printf((UB*)"BARCODE  %s  (%s lasted %d ms)\n", level ? "-> BLACK" : "-> WHITE",
++			  level ? "white" : "black", (INT)((out->t - prev_t) / 1000U));
++		prev_t = out->t;
++	}
++#endif
++	return TRUE;
++}
++
++/* next clean edge, or FALSE if none is ready yet */
++LOCAL BOOL next_edge(EDGE *out)
++{
++	for (;;) {
++		if (ring_tail != ring_head) {
++			UW t = ring[ring_tail].t;
++			if (db_pend && (t - db_t1) >= BC_DEBOUNCE_US) {
++				/* quiet gap before this edge: the burst settled on db_last */
++				if (db_settle(db_last, out)) return TRUE;
++				continue;
++			}
++			db_last = ring[ring_tail].black;
++			ring_tail = (ring_tail + 1U) & (BC_RING - 1U);
++			last_edge_ms = now_ms();	/* for barcode_busy() */
++			d_changes++;
++			if (db_last) d_bars++;
++			if (!db_pend) { db_pend = TRUE; db_t0 = t; }
++			db_t1 = t;
++			continue;
++		}
++		if (db_pend && (now_us() - db_t1) >= BC_DEBOUNCE_US)
++			return db_settle(pin_black(), out);	/* quiet now: read the pin */
++		return FALSE;
++	}
++}
++
+ LOCAL void barcode_task(INT stacd, void *exinf)
+ {
+ 	static UW et[BC_MAX_EDGES];		/* edge times of the current frame */
+@@ -108,24 +214,31 @@ LOCAL void barcode_task(INT stacd, void *exinf)
+ 	UB last_black = 0;
+ 	UW widest = 0, t_start = 0;
+ 	BOOL broken = FALSE;
++#if BC_DIAG
++	UW d_t = 0;
++#endif
+ 
+ 	(void)stacd; (void)exinf;
+ 	gpio_set_pin(PIN_BARCODE, GPIO_MODE_IN);
++	db_level = pin_black();
+ 	CHECK(gpio_irq_attach(PIN_BARCODE, GPIO_EV_BOTH, bc_isr), "barcode irq");	/* core 0 */
++#if BC_DIAG
++	tm_printf((UB*)"BARCODE sensor on GP%d reads %s now (filter %d ms)\n", PIN_BARCODE,
++		  pin_black() ? "BLACK" : "WHITE", (INT)(BC_DEBOUNCE_US / 1000U));
++	d_t = now_ms();
++#endif
+ 
+ 	for (;;) {
+ 		UW now;
+ 
+-		tk_slp_tsk(20);
++		/* settling a burst: come back as soon as it can be decided */
++		tk_slp_tsk(db_pend ? (BC_DEBOUNCE_US / 1000U + 1U) : 20);
+ 		tk_can_wup(TSK_SELF);
+ 
+-		/* 1. take the edges the ISR has stamped */
+-		while (ring_tail != ring_head) {
++		/* 1. take the (debounced) edges */
++		for (;;) {
+ 			EDGE e;
+-			e.t = ring[ring_tail].t;
+-			e.black = ring[ring_tail].black;
+-			ring_tail = (ring_tail + 1U) & (BC_RING - 1U);
+-			last_edge_ms = now_ms();		/* for barcode_busy() */
++			if (!next_edge(&e)) break;
+ 
+ 			if (!in_frame) {
+ 				if (!e.black) continue;		/* wait for white -> black */
+@@ -149,11 +262,28 @@ LOCAL void barcode_task(INT stacd, void *exinf)
+ 			last_black = e.black;
+ 		}
+ 
++#if BC_DIAG
++		if (now_ms() - d_t >= BC_DIAG_MS) {
++			if (d_changes > 0)
++				tm_printf((UB*)"BARCODE sensor: %d raw changes (%d black) -> %d real after filtering, in %d ms, now %s\n",
++					  (INT)d_changes, (INT)d_bars, (INT)d_clean, (INT)(now_ms() - d_t),
++					  pin_black() ? "BLACK" : "WHITE");
++			d_changes = 0; d_bars = 0; d_clean = 0; d_t = now_ms();
++		}
++#endif
++
+ 		/* 2. frame over? (white for long enough after a black -> white) */
+ 		if (!in_frame) continue;
+ 		now = now_ms();
+ 		if (widest > BC_MAX_EL_MS * 1000U || (now - t_start) > BC_MAX_FRAME_MS) {
+ 			in_frame = FALSE;			/* the line or a junction */
++#if BC_DIAG
++			if (n >= 3)
++				tm_printf((UB*)"BARCODE ignored after %d black bars: %s\n", n / 2,
++					  widest > BC_MAX_EL_MS * 1000U
++					  ? "one bar/space took over 1.5 s (too slow, or the line / a junction)"
++					  : "took over 16 s (too slow)");
++#endif
+ 			continue;
+ 		}
+ 		{
+@@ -184,10 +314,10 @@ LOCAL void barcode_task(INT stacd, void *exinf)
+ 				tm_printf((UB*)"BARCODE \"%s\"%s -> %s\n", txt,
+ 					  rev ? " (read backwards)" : "", act_name[info.action]);
+ 				mission_event(EV_BARCODE);
+-			} else if (n - 1 >= 9) {		/* ignore single specks */
++			} else if (n - 1 >= (BC_DIAG ? 3 : 9)) {	/* ignore single specks */
+ 				info.bad++;
+-				tm_printf((UB*)"BARCODE not read: %s (%d elements, need 29 for one letter)%s\n",
+-					  err_text(r), n - 1, broken ? " [an edge was missed]" : "");
++				tm_printf((UB*)"BARCODE not read: %s (%d black bars, *A* has 15; %d elements, need 29)%s\n",
++					  err_text(r), n / 2, n - 1, broken ? " [an edge was missed]" : "");
+ 				/* every bar / space in ms, to see what went wrong:
+ 				   wide ones should be ~3 x the narrow ones */
+ 				tm_printf((UB*)"BARCODE widths ms (bar space bar ...):");
+@@ -200,6 +330,7 @@ LOCAL void barcode_task(INT stacd, void *exinf)
+ 
+ EXPORT ER barcode_start(void)
+ {
++	if (!map_ready) map_boot_default();
+ 	ID tid = app_start_task((FP)barcode_task, PRI_BARCODE, CORE_BARCODE, "barcode");
+ 	if (tid < E_OK) return tid;
+ 	bc_tid = tid;
+diff --git a/Claude outputs/INF2004-IS27-FINAL/lib/liblwip/sysdepend/pico_rp2040/mqtt_utk.c b/Claude outputs/INF2004-IS27-FINAL/lib/liblwip/sysdepend/pico_rp2040/mqtt_utk.c
+index 6740084..3603f3d 100644
+--- a/Claude outputs/INF2004-IS27-FINAL/lib/liblwip/sysdepend/pico_rp2040/mqtt_utk.c	
++++ b/Claude outputs/INF2004-IS27-FINAL/lib/liblwip/sysdepend/pico_rp2040/mqtt_utk.c	
+@@ -15,7 +15,8 @@
+  *	    COMMS_PUMP_MS it takes frames that application tasks queued with
+  *	    comms_publish() and publishes them as BINARY payloads (Change
+  *	    Requirement 11: no text values) on the robot/... topics;
+- *	  - the client subscribes to robot/cmd and hands each complete payload to
++ *	  - the client subscribes to robot/cmd and robot/map (barcode map, marked
++ *	    with COMMS_RX_MAP_MARK) and hands each complete payload to
+  *	    cmd_dispatch_task;
+  *	  - reconnect uses 1 s, 2 s, 4 s ... capped at 10 s backoff (NFR-B1-3).
+  *	All hand-over to the rest of the firmware goes through comms_port.h
+@@ -56,6 +57,7 @@
+ #define MQTT_UTK_RX_DATA_MAX	COMMS_RX_MAX
+ 
+ #define MQTT_CMD_TOPIC		MQTT_TOPIC_ROOT "/cmd"
++#define MQTT_MAP_TOPIC		MQTT_TOPIC_ROOT "/map"	/* barcode map from the GUI, retained */
+ 
+ /* One row per comms_topic_t, in the same order. */
+ static const struct {
+@@ -70,6 +72,7 @@ static const struct {
+ 	{ MQTT_TOPIC_ROOT "/status",       0, 1 },	/* COMMS_TOPIC_STATUS (retained) */
+ 	{ MQTT_TOPIC_ROOT "/event/fault",  1, 0 },	/* COMMS_TOPIC_FAULT (QoS 1) */
+ 	{ MQTT_TOPIC_ROOT "/tlm/resources", 0, 0 },	/* COMMS_TOPIC_RESOURCES    */
++	{ MQTT_TOPIC_ROOT "/tlm/map",      1, 0 },	/* COMMS_TOPIC_MAP_ACK      */
+ };
+ 
+ static mqtt_client_t	*client;
+@@ -82,7 +85,13 @@ static u32_t		retry_ms = MQTT_UTK_RETRY_MIN_MS;
+  * one or more data callbacks; the payload is kept until the fragment carrying
+  * MQTT_DATA_FLAG_LAST shows up. The payload is BINARY: it is never printed as
+  * text and never altered. A payload longer than the buffer is discarded whole. */
+-static u8_t		rx_is_cmd;
++/* rx_kind: what the message being received is.  A robot/map payload is
++ * handed over with COMMS_RX_MAP_MARK in front so the comms task can tell
++ * it from a command without a second buffer. */
++#define RX_NONE			0
++#define RX_CMD			1
++#define RX_MAP			2
++static u8_t		rx_kind;
+ static u8_t		rx_data[MQTT_UTK_RX_DATA_MAX];
+ static u16_t		rx_len;
+ static u8_t		rx_overflow;
+@@ -105,9 +114,13 @@ static void incoming_publish_cb(void *arg, const char *topic, u32_t tot_len)
+ 	(void)arg;
+ 	(void)tot_len;
+ 
+-	rx_is_cmd = str_equal(topic, MQTT_CMD_TOPIC);
++	rx_kind = str_equal(topic, MQTT_CMD_TOPIC) ? RX_CMD
++		: str_equal(topic, MQTT_MAP_TOPIC) ? RX_MAP : RX_NONE;
+ 	rx_len = 0;
+ 	rx_overflow = 0;
++	if(rx_kind == RX_MAP) {
++		rx_data[rx_len++] = COMMS_RX_MAP_MARK;
++	}
+ }
+ 
+ static void incoming_data_cb(void *arg, const u8_t *data, u16_t len, u8_t flags)
+@@ -116,7 +129,7 @@ static void incoming_data_cb(void *arg, const u8_t *data, u16_t len, u8_t flags)
+ 
+ 	(void)arg;
+ 
+-	if(!rx_is_cmd) {
++	if(rx_kind == RX_NONE) {
+ 		return;
+ 	}
+ 
+@@ -129,7 +142,9 @@ static void incoming_data_cb(void *arg, const u8_t *data, u16_t len, u8_t flags)
+ 	}
+ 
+ 	if((flags & MQTT_DATA_FLAG_LAST) != 0) {
+-		if(!rx_overflow) {
++		if((rx_kind == RX_MAP) && (rx_len <= 1)) {
++			/* empty retained message = map cleared on the broker: keep the current map */
++		} else if(!rx_overflow) {
+ 			comms_port_rx_push(rx_data, rx_len);
+ #if COMMS_DEBUG
+ 			tm_printf((UB*)"mqtt: RX cmd %d byte(s), first=0x%02x\n",
+@@ -138,7 +153,7 @@ static void incoming_data_cb(void *arg, const u8_t *data, u16_t len, u8_t flags)
+ 		} else {
+ 			tm_printf((UB*)"mqtt: RX cmd too long, discarded\n");
+ 		}
+-		rx_is_cmd = 0;
++		rx_kind = RX_NONE;
+ 	}
+ }
+ 
+@@ -146,7 +161,7 @@ static void subscribe_done_cb(void *arg, err_t result)
+ {
+ 	(void)arg;
+ 	if(result == ERR_OK) {
+-		tm_printf((UB*)"mqtt: subscribed to " MQTT_CMD_TOPIC "\n");
++		tm_printf((UB*)"mqtt: subscribed to %s\n", (arg != NULL) ? MQTT_MAP_TOPIC : MQTT_CMD_TOPIC);
+ 	} else {
+ 		tm_printf((UB*)"mqtt: subscribe failed, err=%d\n", (int)result);
+ 	}
+@@ -266,6 +281,15 @@ static void connection_cb(mqtt_client_t *c, void *arg, mqtt_connection_status_t
+ 			tm_printf((UB*)"mqtt: mqtt_subscribe() failed, err=%d\n",
+ 				  (int)err);
+ 		}
++		/* The barcode map is retained, so the broker sends the GUI's
++		 * last map straight after this subscribe (also after a reconnect).
++		 * arg != NULL only tells subscribe_done_cb which topic it was. */
++		err = mqtt_subscribe(client, MQTT_MAP_TOPIC, 1 /* qos */,
++				     subscribe_done_cb, (void *)1);
++		if(err != ERR_OK) {
++			tm_printf((UB*)"mqtt: mqtt_subscribe(map) failed, err=%d\n",
++				  (int)err);
++		}
+ 
+ 		comms_port_mqtt_state(1);
+ 	} else {
+diff --git a/Claude outputs/INF2004-IS27-FINAL/testing/comms_test/frames_dump.c b/Claude outputs/INF2004-IS27-FINAL/testing/comms_test/frames_dump.c
+index b58dcd5..6768c5f 100644
+--- a/Claude outputs/INF2004-IS27-FINAL/testing/comms_test/frames_dump.c	
++++ b/Claude outputs/INF2004-IS27-FINAL/testing/comms_test/frames_dump.c	
+@@ -34,5 +34,20 @@ int main(void)
+ 		dump("resources", b, fr_resources(b, 3210, &r));
+ 	}
+ 	dump("saturate", b, fr_motion(b, 0, 5000, -5000, 99999, 0, 0));
++	{
++		/* barcode map: A=L B=R C=U D=S Z=S, rest straight */
++		uint8_t act[FR_MAP_LETTERS] = { 1, 2, 3, 4 }, back[FR_MAP_LETTERS], bad[FR_MAP_BYTES];
++		uint32_t ok, i;
++		act[25] = 4;
++		dump("map_ack", b, fr_map_ack(b, act, 1));
++		ok = fr_map_decode(b, FR_MAP_BYTES, back);		/* first 10 bytes = robot/map */
++		for (i = 0; i < FR_MAP_LETTERS; i++) ok = ok && back[i] == act[i];
++		ok = ok && !fr_map_decode(b, FR_MAP_ACK_BYTES, back);	/* wrong length */
++		for (i = 0; i < FR_MAP_BYTES; i++) bad[i] = b[i];
++		bad[0] = (uint8_t)((bad[0] & ~7U) | 5U);		/* A = 5: no such action */
++		back[0] = 9;
++		ok = ok && !fr_map_decode(bad, FR_MAP_BYTES, back) && back[0] == 9;	/* untouched */
++		printf("mapdecode %d\n", (int)ok);
++	}
+ 	return 0;
+ }
+diff --git a/Claude outputs/INF2004-IS27-FINAL/testing/comms_test/test_frames.py b/Claude outputs/INF2004-IS27-FINAL/testing/comms_test/test_frames.py
+index 4a1fb5d..7cae887 100644
+--- a/Claude outputs/INF2004-IS27-FINAL/testing/comms_test/test_frames.py	
++++ b/Claude outputs/INF2004-IS27-FINAL/testing/comms_test/test_frames.py	
+@@ -9,7 +9,9 @@ import comms_codec as c
+ out = subprocess.check_output([os.path.join(here, "frames_dump")], text=True)
+ rows = [l.split() for l in out.splitlines()]
+ speedcmd = int([v for k, v in rows if k == "speedcmd"][0])
+-fr = {k: bytes.fromhex(v) for k, v in rows if k != "speedcmd"}
++mapdecode = int([v for k, v in rows if k == "mapdecode"][0])
++fr = {k: bytes.fromhex(v) for k, v in rows if k not in ("speedcmd", "mapdecode")}
++MAP = [1, 2, 3, 4] + [0] * 21 + [4]
+ want = {
+     "status":   (c.decode_status,   {"seq": 7, "up_s": 123456, "mode": "AVOID", "faults": 0x203, "tx_drop": True}),
+     "fault":    (c.decode_fault,    {"t_ms": 70000 & 0xFFFF, "raised": 0x088}),
+@@ -25,6 +27,7 @@ want = {
+                                        "mbfs_max": 12, "cycs": 1, "cycs_max": 12, "queue_pct": 5, "drops": 0,
+                                        "motion_us": 187, "line_us": 96}),
+     "saturate": (c.decode_motion,   {"vl": 1023, "vr": -1024, "dist_cm": 16383}),
++    "map_ack":  (c.decode_map_ack,  {"map": MAP, "received": True, "text": "A=L B=R C=U D=S Z=S"}),
+ }
+ fails = 0
+ ok_sp = (speedcmd == 120 and c.encode_tune(120, 40, 1800) == bytes([0, 12, 40, 18]) and
+@@ -32,6 +35,18 @@ ok_sp = (speedcmd == 120 and c.encode_tune(120, 40, 1800) == bytes([0, 12, 40, 1
+          c.encode_tune(120, 40, 1800, False) == bytes([0, 12, 40, 18, 1]))
+ print("tuning command      %s" % ("OK" if ok_sp else "WRONG (%d)" % speedcmd))
+ fails += not ok_sp
++# GUI side: text box -> robot/map bytes must be what the car's C decoder reads
++ok_map = (mapdecode == 1 and c.parse_map_text("A=L b=r, C=U; D=S Z=STOP") == MAP and
++          c.encode_map(MAP) == fr["map_ack"][:10] and c.decode_map(c.encode_map(MAP)) == MAP and
++          c.parse_map_text("") == [0] * 26)
++for bad in ("A=X", "AB=L", "A", "1=L"):
++    try:
++        c.parse_map_text(bad)
++        ok_map = False
++    except ValueError:
++        pass
++print("barcode map         %s" % ("OK" if ok_map else "WRONG"))
++fails += not ok_map
+ for k, (dec, exp) in want.items():
+     got = dec(fr[k])
+     bad = {f: (got[f], v) for f, v in exp.items() if got[f] != v}
+diff --git a/Claude outputs/INF2004-IS27-FINAL/tools/comms/README_GUI.md b/Claude outputs/INF2004-IS27-FINAL/tools/comms/README_GUI.md
+index 622f013..6d1be2d 100644
+--- a/Claude outputs/INF2004-IS27-FINAL/tools/comms/README_GUI.md	
++++ b/Claude outputs/INF2004-IS27-FINAL/tools/comms/README_GUI.md	
+@@ -53,3 +53,24 @@ The **Topic root** must match `MQTT_TOPIC_ROOT` on the car (default `robot`).
+ - `is27_gui.py`: the window.
+ - `comms_codec.py`: decodes and encodes the binary frames, mirroring `app_program/subsystem1/comms_frames.h`. It is checked against the car's C code by `testing/comms_test`.
+ - `comms_dashboard.py`: the old text-only monitor, still works.
++
++## Barcode map (16 Nov)
++
++The row under the tuning controls sets what each barcode letter does.
++Type it as `LETTER=ACTION` pairs, e.g. `A=L B=R C=U D=S`:
++
++| Action | Car does |
++|---|---|
++| `L` | turn left at the next junction |
++| `R` | turn right at the next junction |
++| `U` | U-turn |
++| `S` | stop (end of course) |
++| `-` or not listed | drive straight on |
++
++**Send map** publishes it to `robot/map` (QoS 1, retained), so the car gets it
++again every time it reconnects. **Clear map** sends "all straight".
++The car replies on `robot/tlm/map` every 5 s; the right end of the row shows
++"Car is using: ... (from GUI)". Amber "(built-in, GUI map not received)" means
++the car is still on `BC_ACTION_MAP` from `car_config.h` (all straight by default).
++Payload: 26 x 3 bits, letter A first, LSB-first (10 bytes); the reply adds one
++flags byte (bit 0 = map received). START works with or without a map.
+diff --git a/Claude outputs/INF2004-IS27-FINAL/tools/comms/comms_codec.py b/Claude outputs/INF2004-IS27-FINAL/tools/comms/comms_codec.py
+index fc3aac2..b1a25b1 100644
+--- a/Claude outputs/INF2004-IS27-FINAL/tools/comms/comms_codec.py	
++++ b/Claude outputs/INF2004-IS27-FINAL/tools/comms/comms_codec.py	
+@@ -13,13 +13,14 @@ FAULT_NAMES = ["MOTOR_STALL", "ENCODER", "IMU", "NO_ECHO", "WIFI_LOSS", "MQTT_LO
+                "LINE", "AVOID", "MOTION", "SUDDEN_IMPACT", "COMMS", "(reserved)"]
+ CMD_CODES = {"START": 1, "STOP": 2, "PAUSE": 3, "RESUME": 4, "PING": 5, "UTURN": 6, "REVERSE": 7}
+ LINE_MODES = ["off", "track", "centred", "recover", "junction", "LOST", "bend stop", "pivot"]
+-BC_ACTIONS = ["none", "LEFT", "RIGHT", "U-TURN", "END", "?", "?", "?"]
++BC_ACTIONS = ["straight", "LEFT", "RIGHT", "U-TURN", "END", "?", "?", "?"]
+ OWNERS = ["NONE", "LINE", "MISSION", "?"]
+ OBST_ACTIONS = ["none", "LEFT", "RIGHT", "BLOCKED"]
+ OBST_STAGES = ["FAILED", "DETECTED", "FALSE_ALARM", "SWEPT", "GONE", "BLOCKED", "PASSED", "REJOINED"]
+ IMU_EVENTS = ["HUMP", "IMPACT", "TILT"]
+ 
+-SIZES = {"status": 6, "fault": 4, "motion": 7, "line": 8, "terrain": 7, "obstacle": 8, "resources": 15}
++SIZES = {"status": 6, "fault": 4, "motion": 7, "line": 8, "terrain": 7, "obstacle": 8, "resources": 15,
++         "map": 10, "map_ack": 11}
+ 
+ 
+ def _fields(frame, spec):
+@@ -159,8 +160,64 @@ def encode_cmd(name, cmd_id=0):
+     return bytes([(cmd_id << 3) | CMD_CODES[name.upper()]])
+ 
+ 
++# ---- barcode map (robot/map in, robot/tlm/map back) ----
++# 26 letters x 3 bits, A first, LSB-first like every other frame.
++# Codes match BC_ACT_* in car.h: 0 straight, 1 left, 2 right, 3 U-turn, 4 stop.
++MAP_LETTERS = 26
++MAP_CODES = {"-": 0, "F": 0, "STRAIGHT": 0, "L": 1, "LEFT": 1, "R": 2, "RIGHT": 2,
++             "U": 3, "UTURN": 3, "U-TURN": 3, "S": 4, "STOP": 4}
++MAP_LETTER_OF = "-LRUS"
++
++
++def parse_map_text(text):
++    """'A=L B=R C=U D=S' -> list of 26 codes.  Separators: spaces, commas or
++    semicolons.  Letters not named stay 0 (straight).  Raises ValueError
++    with a message fit to show the user."""
++    act = [0] * MAP_LETTERS
++    for item in text.replace(",", " ").replace(";", " ").split():
++        if "=" not in item:
++            raise ValueError("'%s': write it as LETTER=ACTION, e.g. A=L" % item)
++        k, v = (x.strip().upper() for x in item.split("=", 1))
++        if len(k) != 1 or not "A" <= k <= "Z":
++            raise ValueError("'%s': the barcode must be one letter A..Z" % item)
++        if v not in MAP_CODES:
++            raise ValueError("'%s': action must be L, R, U, S or - (straight)" % item)
++        act[ord(k) - ord("A")] = MAP_CODES[v]
++    return act
++
++
++def map_to_text(act):
++    """list of 26 codes -> 'A=L B=R' (straight letters left out)"""
++    parts = ["%s=%s" % (chr(ord("A") + i), MAP_LETTER_OF[c] if 0 <= c <= 4 else "?")
++             for i, c in enumerate(act) if c != 0]
++    return " ".join(parts) if parts else "all straight"
++
++
++def encode_map(act):
++    """robot/map payload: 10 bytes"""
++    if len(act) != MAP_LETTERS or any(not 0 <= c <= 4 for c in act):
++        raise ValueError("map must be 26 codes 0..4")
++    v = 0
++    for i, c in enumerate(act):
++        v |= c << (3 * i)
++    return v.to_bytes(SIZES["map"], "little")
++
++
++def decode_map(frame):
++    _check(frame, "map")
++    v = int.from_bytes(frame, "little")
++    return [(v >> (3 * i)) & 7 for i in range(MAP_LETTERS)]
++
++
++def decode_map_ack(frame):
++    """robot/tlm/map: the map the car is using + flags (bit 0 = received from GUI)"""
++    _check(frame, "map_ack")
++    act = decode_map(frame[:SIZES["map"]])
++    return {"map": act, "received": bool(frame[SIZES["map"]] & 1), "text": map_to_text(act)}
++
++
+ DECODERS = {
+     "status": decode_status, "event/fault": decode_fault, "tlm/motion": decode_motion,
+     "tlm/line": decode_line, "tlm/terrain": decode_terrain, "tlm/obstacle": decode_obstacle,
+-    "tlm/resources": decode_resources,
++    "tlm/resources": decode_resources, "tlm/map": decode_map_ack,
+ }
+diff --git a/Claude outputs/INF2004-IS27-FINAL/tools/comms/is27_gui.py b/Claude outputs/INF2004-IS27-FINAL/tools/comms/is27_gui.py
+index 53d3b49..a1e0299 100644
+--- a/Claude outputs/INF2004-IS27-FINAL/tools/comms/is27_gui.py	
++++ b/Claude outputs/INF2004-IS27-FINAL/tools/comms/is27_gui.py	
+@@ -6,6 +6,8 @@ Connects to the MQTT broker, decodes the car's binary frames
+ (comms_codec.py) and sorts them into one dataset per topic:
+ 
+   Overview   mode, uptime, fault lamps, live values, event log, commands
++  Barcode map  A=L B=R C=U D=S box: sent retained on robot/map, the car
++             confirms the map it is using on robot/tlm/map
+   Motion     wheel speeds + distance (robot/tlm/motion)
+   Line       line position, sensor mode, barcodes (robot/tlm/line)
+   Terrain    pitch, roll, compass, humps (robot/tlm/terrain)
+@@ -35,7 +37,8 @@ import time
+ import tkinter as tk
+ from tkinter import ttk, filedialog, messagebox
+ 
+-from comms_codec import (DECODERS, CMD_CODES, FAULT_NAMES, encode, encode_cmd, encode_tune)
++from comms_codec import (DECODERS, CMD_CODES, FAULT_NAMES, encode, encode_cmd, encode_tune,
++                         parse_map_text, encode_map, decode_map, map_to_text, MAP_LETTERS)
+ 
+ try:
+     import paho.mqtt.client as mqtt
+@@ -218,6 +221,8 @@ class App:
+         self.last = {}                  # latest decoded value per topic
+         self.prev_mode = None
+         self.prev_bc = None
++        self.map_seen = False           # broker's retained robot/map shown in the box yet?
++        self.car_map = None             # last robot/tlm/map from the car
+         self.prev_hump_ev = 0
+         self.prev_faults = 0
+         self.last_sweep = None
+@@ -319,6 +324,25 @@ class App:
+         self.b_speed.pack(side="left", padx=8)
+         self.cmd_buttons.append(self.b_speed)
+         ttk.Label(tune, text="(car resets these on restart)", foreground=MUTED).pack(side="left")
++
++        # barcode letter -> action.  Retained on the broker, so the car gets
++        # it again whenever it (re)connects.  Letters not named go straight.
++        bmap = ttk.Frame(r, padding=(10, 0, 10, 6))
++        bmap.pack(fill="x")
++        ttk.Label(bmap, text="Barcode map:").pack(side="left")
++        self.e_map = ttk.Entry(bmap, width=34)
++        self.e_map.insert(0, "A=L B=R C=U D=S")
++        self.e_map.pack(side="left", padx=(4, 4))
++        self.e_map.bind("<Return>", lambda e: self.send_map())
++        self.b_map = ttk.Button(bmap, text="Send map", command=self.send_map)
++        self.b_map.pack(side="left", padx=3)
++        self.b_map_clear = ttk.Button(bmap, text="Clear map", command=lambda: self.send_map(clear=True))
++        self.b_map_clear.pack(side="left", padx=3)
++        self.cmd_buttons += [self.b_map, self.b_map_clear]
++        ttk.Label(bmap, text="L left  R right  U U-turn  S stop  (others: straight)",
++                  foreground=MUTED).pack(side="left", padx=(8, 0))
++        self.l_map = ttk.Label(bmap, text="Car is using: (not heard yet)", foreground=MUTED)
++        self.l_map.pack(side="right")
+         ttk.Button(cmd, text="Export all CSV", command=self.export_all).pack(side="right")
+         ttk.Button(cmd, text="Clear all", command=self.clear_all).pack(side="right", padx=6)
+ 
+@@ -567,6 +591,7 @@ class App:
+             c = mqtt.Client(client_id="is27-gui-%d" % random.randint(0, 99999))
+ 
+         def on_connect(cl, u, flags, rc, props=None):
++            self.map_seen = False
+             cl.subscribe(root + "/#", qos=1)
+             self.q.put(("conn", True, "connected to %s" % host))
+ 
+@@ -610,6 +635,24 @@ class App:
+         self.event("sent TUNING speed %d mm/s, bends %d %%, KP %d, pivot %s" %
+                    (frame[1] * 10, frame[2], frame[3] * 100, "on" if frame[4] == 2 else "off"))
+ 
++    def send_map(self, clear=False):
++        """Publish the barcode map to <root>/map, QoS 1, retained."""
++        text = "" if clear else self.e_map.get()
++        try:
++            act = parse_map_text(text)
++        except ValueError as e:
++            messagebox.showerror("Barcode map", "%s\n\nExample: A=L B=R C=U D=S" % e)
++            return
++        if clear:
++            self.e_map.delete(0, "end")
++        frame = encode_map(act)
++        if self.demo:
++            self.demo.bc_map = act
++            self.handle(time.time(), "tlm/map", frame + b"\x01")     # the demo car confirms at once
++        elif self.client:
++            self.client.publish(self.root_topic + "/map", frame, qos=1, retain=True)
++        self.event("sent barcode map: %s" % map_to_text(act))
++
+     def send(self, name):
+         self.cmd_id = (self.cmd_id + 1) % 32
+         frame = encode_cmd(name, self.cmd_id)
+@@ -656,6 +699,18 @@ class App:
+     def handle(self, t, sub, payload):
+         self.msgs += 1
+         self.last_rx = t
++        if sub == "map":                # our own retained map, echoed by the broker
++            if not self.map_seen and len(payload) == 10:
++                self.map_seen = True    # first one after connecting: show what the broker holds
++                try:
++                    act = decode_map(payload)
++                except ValueError:
++                    return
++                if all(0 <= c <= 4 for c in act):
++                    self.e_map.delete(0, "end")
++                    self.e_map.insert(0, " ".join("%s=%s" % (chr(65 + i), "-LRUS"[c])
++                                                  for i, c in enumerate(act) if c))
++            return
+         dec = DECODERS.get(sub)
+         if dec is None:
+             return
+@@ -716,6 +771,13 @@ class App:
+                 self.event("obstacle: stopped at %d cm" % d["dist_cm"])
+             else:
+                 self.event("obstacle: %s" % d["stage"].lower().replace("_", " "))
++        elif sub == "tlm/map":
++            src = "from GUI" if d["received"] else "built-in, GUI map not received"
++            self.l_map.configure(text="Car is using: %s (%s)" % (d["text"], src),
++                                 foreground=INK if d["received"] else AMBER)
++            if (d["map"], d["received"]) != self.car_map:
++                self.car_map = (d["map"], d["received"])
++                self.event("car barcode map: %s (%s)" % (d["text"], src))
+         elif sub == "tlm/resources":
+             self.ds["resources"].add({"t": t, **{k: d[k] for k in self.ds["resources"].columns}})
+ 
+@@ -919,6 +981,7 @@ class DemoCar(threading.Thread):
+         self.back_to_line = 0
+         self.speed, self.bend, self.kp = 30, 50, 1000
+         self.pivot = False
++        self.bc_map = [0] * MAP_LETTERS
+ 
+     def command(self, name):
+         self.mode = {"START": 2, "RESUME": 2, "STOP": 1, "PAUSE": 6, "UTURN": 3, "REVERSE": 5}.get(name, self.mode)
+@@ -954,7 +1017,8 @@ class DemoCar(threading.Thread):
+             pos = int(curve * 900 + random.gauss(0, 40)) if moving else 0
+             mode = (7 if self.pivot and abs(pos) > 600 else 1) if abs(pos) > 150 else 2
+             if moving and int(t) % 20 == 10 and k % 5 == 0:
+-                bc_char, bc_act = random.choice([(ord("A"), 1), (ord("B"), 2), (ord("Z"), 0)])
++                bc_char = random.choice([ord("A"), ord("B"), ord("C"), ord("Z")])
++                bc_act = self.bc_map[bc_char - ord("A")]
+             ph = (t % 25)
+             pitch = 120 * math.sin((ph - 10) / 1.2 * math.pi) if 10 < ph < 12.4 and moving else random.gauss(0, 5)
+             hump_ev = 1 if 12.4 < ph < 13.4 and moving else 0
+-- 
+2.43.0
+

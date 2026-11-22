@@ -27,3 +27,6 @@ config/wifi_secrets.h
 __pycache__/
 *.pyc
 testing/subsystem1/host/test_codec
+
+# local WiFi credentials, anywhere in the repo
+**/wifi_secrets.h
