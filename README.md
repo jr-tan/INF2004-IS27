@@ -37,8 +37,9 @@ Who owns what (pins, tasks, interfaces) is in **[`TEAM.md`](TEAM.md)**.
 | `build_make/` | makefiles; the firmware is built here |
 | `tools/comms/` | desktop GUI (`is27_gui.py`), text dashboard, frame codec, Mosquitto config |
 | `tools/elf2uf2/` | source of the ELF -> UF2 converter (the build compiles it for your computer) |
+| `tools/barrc_check.py` | automated BARR-C rule check over `app_program/` (see 7) |
 | `testing/` | PC tests: barcode decoder, comms frames, IMU maths, line simulator, obstacle scan |
-| `docs/` | comms (Buddy 1) design notes |
+| `docs/` | `buddy1_comms.md` (comms design notes), `barr_c_conformance.md` (coding standard and Change Requirement 1), the BARR-C:2018 standard (PDF) and the Week 8 Tribunal 1 document (docx) |
 | `kernel/`, `include/`, `device/`, `lib/`, `etc/` | micro T-Kernel 3.0, its drivers, the WiFi / lwIP / MQTT glue |
 
 ---
@@ -169,7 +170,7 @@ Measured on this car (12 Nov): width with wheels 12.5 cm, wheel track
 ## 7. Coding standard
 
 `app_program/` follows the **BARR-C:2018 Embedded C Coding Standard**
-(`barr_c_coding_standard_2018.pdf`) and the Tribunal 1 **Change
+(`docs/barr_c_coding_standard_2018.pdf`) and the Tribunal 1 **Change
 Requirement 1** (shared data packed into words with one writer each).
 What was applied, the documented deviations and how behaviour was
 checked are in **`docs/barr_c_conformance.md`**.
