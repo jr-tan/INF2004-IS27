@@ -113,7 +113,7 @@ static void wheels(int speed, int steer, int *l, int *r)
 	if (steer >= 0) { *l = speed; *r = inner; } else { *l = inner; *r = speed; }
 }
 
-static int run(const double *seg, int nseg, const CAR *car, const LINE_TUNE *k,
+static int run(const double *seg, int nseg, const CAR *car, const line_tune_t *k,
 	       int verbose, double *max_err, double *t_end)
 {
 	build(seg, nseg);
@@ -123,8 +123,8 @@ static int run(const double *seg, int nseg, const CAR *car, const LINE_TUNE *k,
 	double cl = 0, cr = 0;			/* ramped set-points */
 	int tl = 0, tr = 0;
 	int hint = 0;
-	LINE_CTL c;
-	LINE_OUT o;
+	line_ctl_t c;
+	line_out_t o;
 	line_ctl_reset(&c, k, 0, 0, 0);
 	*max_err = 0;
 	for (int ms = 0; ms < 400000; ms++) {
@@ -192,7 +192,7 @@ static const struct track tracks[] = {
 	{"cross junctions x3", T_CROSS, 10},
 };
 
-static int suite(const LINE_TUNE *k, int verbose, int print)
+static int suite(const line_tune_t *k, int verbose, int print)
 {
 	static const double fwd[] = {50, 80};
 	static const double half_out[] = {12, 20, 30};		/* gap wider than the line */
@@ -229,9 +229,9 @@ static int suite(const LINE_TUNE *k, int verbose, int print)
 
 int main(int argc, char **argv)
 {
-	LINE_TUNE k = getenv("INSIDE_TUNE") ? line_tune_inside : line_tune_default;	/* INSIDE_TUNE=1: firmware's inside tuning */
+	line_tune_t k = getenv("INSIDE_TUNE") ? g_line_tune_inside : g_line_tune_default;	/* INSIDE_TUNE=1: firmware's inside tuning */
 	if (getenv("EDGE")) {			/* EDGE=1: line under the left sensor, -1 right */
-		k = line_tune_edge;
+		k = g_line_tune_edge;
 		k.edge_dir = atoi(getenv("EDGE")) >= 0 ? 1 : -1;
 	}
 	int print = (argc > 1) ? atoi(argv[1]) : 1;
@@ -265,7 +265,7 @@ int main(int argc, char **argv)
 
 	if (print < 0) return 0;
 	/* v47-like reference: P + KD only, small hold, no deep logic */
-	LINE_TUNE v47 = line_tune_default; v47.speed = k.speed;
+	line_tune_t v47 = g_line_tune_default; v47.speed = k.speed;
 	v47.deep_pos = 5000;		/* never deep */
 	v47.hold_small = 280; v47.wobble_ms = 2000;
 	v47.speed_min = v47.speed;	/* no slow-down */

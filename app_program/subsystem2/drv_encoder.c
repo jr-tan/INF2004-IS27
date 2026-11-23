@@ -1,117 +1,162 @@
-/*
- *	drv_encoder.c  (Buddy 2)
- *	Quadrature (A/B) encoders inside the two motors, full x4 decoding.
- *	Pins in car_config.h: left Grove 7 (GP7/GP28), right Grove 1 (GP0/GP1).
+/**
+ * @file    drv_encoder.c
+ *  drv_encoder.c  (Buddy 2)
+ *  Quadrature (A/B) encoders inside the two motors, full x4 decoding.
+ *  Pins in car_config.h: left Grove 7 (GP7/GP28), right Grove 1 (GP0/GP1).
  *
- *	Interrupts come through the shared GPIO dispatcher (gpio_irq.c) on
- *	BOTH edges of A and B.  The handler only decodes and counts.
+ *  Interrupts come through the shared GPIO dispatcher (gpio_irq.c) on
+ *  BOTH edges of A and B.  The handler only decodes and counts.
  *
- *	A noise spike is one step forward and one straight back: it cancels.
- *	'count' only goes up: a single step against the current direction is
- *	held back; if the next step returns, both were a bounce; if it goes
- *	the same way, the wheel really reversed and both are counted.
+ *  A noise spike is one step forward and one straight back: it cancels.
+ *  'count' only goes up: a single step against the current direction is
+ *  held back; if the next step returns, both were a bounce; if it goes
+ *  the same way, the wheel really reversed and both are counted.
  */
 #include "subsystem2.h"
 #include <tk/syslib.h>
 #include "../gpio_irq.h"
+#include "drv_encoder.h" /* own header (BARR-C 4.3.c) */
 
-typedef struct {
-	volatile UW	count;
-	volatile W	pos;
-	volatile UW	last_us;
-	volatile UW	glitch;
-	volatile UB	state;		/* (A << 1) | B */
-	volatile B	hint;		/* direction being counted */
-	volatile UB	held;		/* one opposite step held back */
-} ENC;
+typedef struct
+{
+    volatile uint32_t count;
+    volatile int32_t  pos;
+    volatile uint32_t last_us;
+    volatile uint32_t glitch;
+    volatile uint8_t  state; /* (A << 1) | B */
+    volatile int8_t   hint;  /* direction being counted */
+    volatile uint8_t  held;  /* one opposite step held back */
+} enc_t;
 
-static ENC enc[2];
-static const UB pin_a[2] = { PIN_ENC_L_A, PIN_ENC_R_A };
-static const UB pin_b[2] = { PIN_ENC_L_B, PIN_ENC_R_B };
-static const UB rev[2]   = { ENC_L_REVERSE, ENC_R_REVERSE };
+static enc_t         g_enc[2];
+static const uint8_t g_pin_a[2] = {PIN_ENC_L_A, PIN_ENC_R_A};
+static const uint8_t g_pin_b[2] = {PIN_ENC_L_B, PIN_ENC_R_B};
+static const uint8_t g_rev[2]   = {ENC_L_REVERSE, ENC_R_REVERSE};
 
 /* forward sequence 00 -> 10 -> 11 -> 01 -> 00;  [old << 2 | new] */
-static const B qdec[16] = {
-	 0, -1, +1,  0,
-	+1,  0,  0, -1,
-	-1,  0,  0, +1,
-	 0, +1, -1,  0
-};
+static const int8_t g_qdec[16] = {0,  -1, +1, 0,  +1, 0,  0,  -1,
+                                  -1, 0,  0,  +1, 0,  +1, -1, 0};
 
-LOCAL void enc_isr(UINT gpio, UINT events, UW t)
+/**
+ * @brief  Interrupt handler.
+ */
+LOCAL void enc_isr (uint32_t gpio, uint32_t events, uint32_t tval)
 {
-	UINT w = (gpio == pin_a[0] || gpio == pin_b[0]) ? 0U : 1U;
-	ENC *e = &enc[w];
-	UW in = in_w(GPIO_IN);
-	UINT ns = (((in >> pin_a[w]) & 1U) << 1) | ((in >> pin_b[w]) & 1U);
-	UINT os = e->state;
-	INT step;
+    uint32_t wval   = ((gpio == g_pin_a[0]) || (gpio == g_pin_b[0])) ? 0U : 1U;
+    enc_t *  p_ent  = &g_enc[wval];
+    uint32_t in_val = in_w(GPIO_IN);
+    uint32_t ns_val = (((in_val >> g_pin_a[wval]) & 1U) << 1) |
+                      ((in_val >> g_pin_b[wval]) & 1U);
+    uint32_t os_val = p_ent->state;
+    int32_t  step;
 
-	(void)events;
-	if (ns == os) return;			/* spike already gone */
-	e->state = (UB)ns;
-	step = qdec[(os << 2) | ns];
-	if (step == 0) { e->glitch++; return; }	/* two bits at once: resync */
-	if (rev[w]) step = -step;
-	e->pos += step;
+    (void)events;
+    if (ns_val == os_val)
+    {
+        return; /* spike already gone */
+    }
+    p_ent->state = (uint8_t)ns_val;
+    step         = g_qdec[(os_val << 2) | ns_val];
+    if (0 == step)
+    {
+        p_ent->glitch++;
+        return;
+    } /* two bits at once: resync */
+    if (g_rev[wval])
+    {
+        step = -step;
+    }
+    p_ent->pos += step;
 
-	if (step == e->hint) {
-		if (e->held) { e->held = 0; e->glitch++; return; }	/* bounce */
-	} else if (!e->held) {
-		e->held = 1;				/* wait and see */
-		return;
-	} else {
-		e->held = 0;				/* real reversal */
-		e->hint = (B)step;
-		e->count++;
-	}
-	e->count++;
-	e->last_us = t;
+    if (step == p_ent->hint)
+    {
+        if (p_ent->held)
+        {
+            p_ent->held = 0;
+            p_ent->glitch++;
+            return;
+        } /* bounce */
+    }
+    else if (!p_ent->held)
+    {
+        p_ent->held = 1; /* wait and see */
+        return;
+    }
+    else
+    {
+        p_ent->held = 0; /* real reversal */
+        p_ent->hint = (int8_t)step;
+        p_ent->count++;
+    }
+    p_ent->count++;
+    p_ent->last_us = tval;
 }
 
-#define PAD_SCHMITT	(1U << 1)
+#define PAD_SCHMITT (1U << 1)
 
-LOCAL void pin_setup(UINT pin)
+/**
+ * @brief  Pin setup.
+ */
+LOCAL void pin_setup (uint32_t pin)
 {
-	UW pad;
+    uint32_t pad;
 
-	gpio_set_pin(pin, GPIO_MODE_IN);
-	pad = in_w(GPIO(pin));
-	pad |= GPIO_IE | GPIO_PUE | PAD_SCHMITT;	/* pull-up + hysteresis */
-	pad &= ~GPIO_PDE;
-	out_w(GPIO(pin), pad);
+    gpio_set_pin(pin, GPIO_MODE_IN);
+    pad = in_w(GPIO(pin));
+    pad |= GPIO_IE | GPIO_PUE | PAD_SCHMITT; /* pull-up + hysteresis */
+    pad &= ~GPIO_PDE;
+    out_w(GPIO(pin), pad);
 }
 
-EXPORT ER drv_encoder_init(void)
+/**
+ * @brief  Initialise the module (create its kernel objects).
+ * @return Result as described above.
+ */
+EXPORT ER drv_encoder_init (void)
 {
-	ER er;
-	UINT i;
+    ER       err;
+    uint32_t idx;
 
-	for (i = 0; i < 2; i++) {
-		pin_setup(pin_a[i]);
-		pin_setup(pin_b[i]);
-		enc[i].state = (UB)((gpio_get_val(pin_a[i]) << 1) | gpio_get_val(pin_b[i]));
-		enc[i].hint = 1;
-	}
-	for (i = 0; i < 2; i++) {
-		if ((er = gpio_irq_attach(pin_a[i], GPIO_EV_BOTH, enc_isr)) < E_OK) return er;
-		if ((er = gpio_irq_attach(pin_b[i], GPIO_EV_BOTH, enc_isr)) < E_OK) return er;
-	}
-	return E_OK;
+    for (idx = 0; idx < MOT_WHEELS; idx++)
+    {
+        pin_setup(g_pin_a[idx]);
+        pin_setup(g_pin_b[idx]);
+        g_enc[idx].state = (uint8_t)((gpio_get_val(g_pin_a[idx]) << 1) |
+                                     gpio_get_val(g_pin_b[idx]));
+        g_enc[idx].hint  = 1;
+    }
+    for (idx = 0; idx < MOT_WHEELS; idx++)
+    {
+        err = gpio_irq_attach(g_pin_a[idx], GPIO_EV_BOTH, enc_isr);
+        if (err < E_OK)
+        {
+            return err;
+        }
+        err = gpio_irq_attach(g_pin_b[idx], GPIO_EV_BOTH, enc_isr);
+        if (err < E_OK)
+        {
+            return err;
+        }
+    }
+    return E_OK;
 }
 
-/* DI only masks THIS core; the encoder interrupt runs on core 0, so the
+/** DI only masks THIS core; the encoder interrupt runs on core 0, so the
    caller must be on core 0 (the motion task is pinned there). */
-EXPORT void drv_encoder_snapshot(ENC_SNAP s[2])
+EXPORT void drv_encoder_snapshot (enc_snap_t p_str[2])
 {
-	UINT imask, i;
+    uint32_t imask;
+    uint32_t idx;
 
-	DI(imask);
-	for (i = 0; i < 2; i++) {
-		s[i].count   = enc[i].count;
-		s[i].pos     = enc[i].pos;
-		s[i].last_us = enc[i].last_us;
-		s[i].glitch  = enc[i].glitch;
-	}
-	EI(imask);
+    DI(imask);
+    for (idx = 0; idx < MOT_WHEELS; idx++)
+    {
+        p_str[idx].count   = g_enc[idx].count;
+        p_str[idx].pos     = g_enc[idx].pos;
+        p_str[idx].last_us = g_enc[idx].last_us;
+        p_str[idx].glitch  = g_enc[idx].glitch;
+    }
+    EI(imask);
 }
+
+/*** end of file ***/

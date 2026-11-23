@@ -1,0 +1,46 @@
+# Barr Group Embedded C Coding Standard (BARR-C:2018) layout, IS27.
+# Rules: 1.2.a 80 columns, 1.3 braces (Allman, always), 3.1 spacing,
+# 3.2 alignment, 3.4 4-space indents, 3.5 no tabs, 3.6 LF endings.
+BasedOnStyle: LLVM
+Language: Cpp
+Standard: c++03
+IndentWidth: 4
+TabWidth: 4
+UseTab: Never
+ColumnLimit: 80
+BreakBeforeBraces: Allman
+InsertBraces: true
+AllowShortIfStatementsOnASingleLine: Never
+AllowShortLoopsOnASingleLine: false
+AllowShortBlocksOnASingleLine: Never
+AllowShortFunctionsOnASingleLine: None
+AllowShortCaseLabelsOnASingleLine: false
+AllowShortEnumsOnASingleLine: false
+IndentCaseLabels: true
+IndentCaseBlocks: false
+SpaceBeforeParens: Custom
+SpaceBeforeParensOptions:
+  AfterControlStatements: true
+  AfterFunctionDefinitionName: true
+  AfterFunctionDeclarationName: true
+  AfterForeachMacros: true
+  AfterIfMacros: true
+PointerAlignment: Middle
+DerivePointerAlignment: false
+AlignConsecutiveDeclarations: Consecutive
+AlignConsecutiveAssignments: Consecutive
+AlignConsecutiveMacros: Consecutive
+AlignTrailingComments: true
+AlignEscapedNewlines: Left
+SortIncludes: Never
+ReflowComments: true
+BreakStringLiterals: true
+MaxEmptyLinesToKeep: 1
+KeepEmptyLinesAtTheStartOfBlocks: false
+InsertNewlineAtEOF: true
+LineEnding: LF
+IndentPPDirectives: None
+SpacesBeforeTrailingComments: 2
+BinPackParameters: true
+AlwaysBreakAfterReturnType: None
+PenaltyReturnTypeOnItsOwnLine: 1000

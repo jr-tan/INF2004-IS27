@@ -1,0 +1,5 @@
+# BARR-C:2018 rule 3.6.a: C sources end lines with LF only, on every
+# machine (Windows checkouts would otherwise get CR-LF).
+*.c text eol=lf
+*.h text eol=lf
+.clang-format text eol=lf

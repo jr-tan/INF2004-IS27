@@ -31,7 +31,7 @@ static int reading(double th_deg, double d, double w, double c)
 
 int main(void)
 {
-	SCAN_TUNE k = { 20, 100, 0, 9, 5, 1 };	/* same values as the firmware (12 Nov: beam 0) */
+	scan_tune_t k = { 20, 100, 0, 9, 5, 1 };	/* same values as the firmware (12 Nov: beam 0) */
 	if (getenv("BEAM")) k.beam_deg = atoi(getenv("BEAM"));
 	struct { double d, w, c; int want_dir; } t[] = {
 		{12, 10,  0,  1}, {12, 10,  4, -1}, {12, 10, -4,  1},
@@ -48,10 +48,10 @@ int main(void)
 	else printf("  clean sweeps (+%d to -%d in %d deg steps):\n", smax, smax, sstep);
 	for (unsigned i = 0; i < sizeof t / sizeof t[0]; i++) {
 		int32_t deg[SCAN_MAX_PTS], cm[SCAN_MAX_PTS], n = 0;
-		SCAN_PROFILE p;
+		scan_profile_t p;
 		for (int a = smax; a >= -smax; a -= sstep) { deg[n] = a; cm[n] = reading(a, t[i].d, t[i].w, t[i].c); n++; }
 		if (rep) cm[(rand() % (n - 2)) + 1] = 255;	/* one missed echo */
-		scan_profile(&k, deg, cm, n, &p);
+		scan_profile_compute(&k, deg, cm, n, &p);
 		double true_l = t[i].c + t[i].w / 2, true_r = t[i].c - t[i].w / 2;
 		/* a box this wide this close fills the whole +-60 sweep: the
 		   car can't see past either edge, so it must wait (BLOCK) */
