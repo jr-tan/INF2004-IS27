@@ -1,933 +1,465 @@
-/**
- * @file subsystem4.c
- * @brief Filtering, hump-height integration, hardware spinlock fault bitmask,
- *        and explicit binary telemetry packing for Buddy 4.
- */
-#include <stdbool.h>
-#include <stdint.h>
-#include <tk/tkernel.h>
-#include "subsystem4.h"
-#include "subsystem4_gy511.h"
-
-extern float atan2f(float y, float x);
-extern float sqrtf(float x);
-extern float sinf(float x);
-extern float fabsf(float x);
-extern float roundf(float x); 
-
 /*
- * RP2040 Hardware Spinlock #30 (SIO_BASE + 0x100 + 30*4) for cross-core/task
- * and ISR-safe atomic Read-Modify-Write on shared packed words (Tribunal 1 R1).
+ *	subsystem4.c  (Buddy 4: IMU, terrain, hump / impact / tilt)
+ *
+ *	GY-511 = LSM303DLHC (or the newer LSM303AGR): accelerometer at I2C
+ *	0x19, magnetometer at 0x1E.  It has NO gyro.  Some boards sold as
+ *	GY-511 carry another chip (IS27's answers at 0x1D only), so the
+ *	setup also finds an LSM303D, ADXL345 or MMA845x (imu_setup below).
+ *
+ *	imu task (priority 14, core 1), every 20 ms (50 Hz):
+ *	  1. read the accelerometer (+-4 g, 2 mg per count), every 5th
+ *	     sample the magnetometer
+ *	  2. pitch / roll from gravity, smoothed (1/4 new)
+ *	  3. while the car is stopped (mission IDLE) learn "level", so the
+ *	     sensor doesn't have to be mounted perfectly flat
+ *	  4. hump: pitch up, then down, then level; height = sum of
+ *	     sin(pitch) x distance (odometry from Buddy 2)
+ *	  5. impact: |a| more than IMU_IMPACT_MG away from 1 g -> FAULT_IMPACT
+ *	  6. tilt: pitch or roll over IMU_TILT_D10 for 300 ms -> EV_TILT
+ *	     (the mission stops the car: it has tipped or been picked up)
+ *	A sensor that stops answering raises FAULT_IMU and is re-initialised
+ *	every second; everything else keeps running without it.
+ *
+ *	INT1 (GP3) is not needed: the task polls at a fixed 50 Hz.
  */
-#define RP2040_SIO_BASE              (0xD0000000UL)
-#define RP2040_SIO_SPINLOCK30        (*(volatile uint32_t *)(RP2040_SIO_BASE + 0x178UL))
+#include "../car.h"
+#include "drv_i2c.h"
+#include "imu_math.h"
 
-static imu_calibration_offsets_t g_calibration = {0};
-static float g_filter_alpha = SUBSYSTEM4_DEFAULT_FILTER_ALPHA;
-static float g_raw_lpf_beta = SUBSYSTEM4_DEFAULT_RAW_LPF_BETA;
+/* ---- mounting: which board axis points forward / left / up (CAL) ----
+   0 = X, 1 = Y, 2 = Z of the sensor board; sign +1 or -1.
+   Check: tilt the nose up -> pitch goes +; lift the left side -> roll goes +. */
+#define IMU_FWD_AXIS		0
+#define IMU_FWD_SIGN		(+1)
+#define IMU_LEFT_AXIS		1
+#define IMU_LEFT_SIGN		(+1)
+#define IMU_UP_AXIS		2
+#define IMU_UP_SIGN		(+1)	/* flipped at run time if it reads -1 g (upside down) */
+#define IMU_SETTLE_SAMPLES	25	/* 0.5 s at 50 Hz before orientation / level are decided */
+LOCAL INT up_sign = IMU_UP_SIGN, left_sign = IMU_LEFT_SIGN;
 
-/* Raw accelerometer LPF state (Assumption A6 mitigation 1) */
-static bool g_raw_lpf_initialized = false;
-static float g_ax_lpf_g = 0.0f;
-static float g_ay_lpf_g = 0.0f;
-static float g_az_lpf_g = 1.0f;
+#define IMU_IMPACT_MG		1500	/* |a| - 1 g above this = impact */
+#define IMU_TILT_D10		350	/* 35 deg */
+#define IMU_TILT_MS		300
+/* picked up (12 Nov evening): lifting the car pushes the accelerometer
+   above 1 g for a while.  IMU_LIFT_HITS of the last IMU_LIFT_WIN raw
+   samples (20 ms each) more than IMU_LIFT_MG above 1 g -> EV_LIFT (the
+   mission safe-stops while driving).  A bump is a 1-sample spike, so it
+   does not count.  CAL: the console prints "IMU lift" with the value. */
+#define IMU_LIFT_MG		250
+#define IMU_LIFT_HITS		3
+#define IMU_LIFT_WIN		4
+#define IMU_EVENT_SHOW_MS	1000	/* event bits stay set this long (telemetry) */
 
-static float g_pitch_filtered_deg = 0.0f;
-static float g_roll_filtered_deg = 0.0f;
-static float g_previous_heading_deg = 0.0f;
-static bool g_heading_initialized = false;
+static const HUMP_TUNE hump_tune = {
+	35,	/* climb above 3.5 deg (a 2 cm rise over a 30 cm ramp is 3.8 deg) */
+	20,	/* level below 2 deg */
+	100,	/* confirm ms */
+	200,	/* level ms */
+	60000,	/* give up ms (the distance limit below normally ends it first) */
+	5,	/* min height mm */
+	1000	/* give up after 1 m of travel without finishing */
+};
 
-/* Hump height accuracy state */
-static float g_prev_pitch_rad = 0.0f;
-static float g_integrated_height_cm = 0.0f;
-static float g_current_hump_peak_cm = 0.0f;
-static float g_peak_hump_height_cm = 0.0f;
-static float g_last_hump_height_cm = 0.0f;
-static float g_pre_entry_height_cm = 0.0f;
-static uint32_t g_hump_entry_streak = 0U;
-static uint32_t g_hump_count = 0U;
-static bool g_hump_active = false;
+#define ACC_ADDR		0x19	/* SA0 high: most GY-511 boards */
+#define ACC_ADDR_ALT		0x18	/* SA0 low: some clones */
+#define MAG_ADDR		0x1E
+/* accelerometer (same map on DLHC and AGR) */
+#define CTRL_REG1_A		0x20
+#define CTRL_REG4_A		0x23
+#define OUT_X_L_A		0x28
+#define AUTO_INC		0x80
+/* magnetometer, DLHC */
+#define CRA_REG_M		0x00
+#define CRB_REG_M		0x01
+#define MR_REG_M		0x02
+#define OUT_X_H_M		0x03
+#define IRA_REG_M		0x0A
+/* magnetometer, AGR */
+#define WHO_AM_I_M		0x4F
+#define CFG_REG_A_M		0x60
+#define CFG_REG_C_M		0x62
+#define OUTX_L_REG_M		0x68
 
-/* Kinematic velocity fallback when wheel odometry is 0 */
-static float g_estimated_vel_mm_s = 0.0f;
+LOCAL IMU_STATUS st;		/* written by the imu task only */
+LOCAL INT mag_type;		/* 0 none, 1 DLHC, 2 AGR, 3 LSM303D */
+LOCAL UB  acc_addr = ACC_ADDR;
+LOCAL UINT setup_tries;
 
-/* Shared atomic words protected by RP2040 hardware spinlock */
-static volatile uint32_t g_shared_fault_bitmask = 0U;
-static volatile uint32_t g_accumulated_odometry_mm = 0U;
-
-static bool g_abort_requested = false;
-static subsystem4_operational_state_t g_operational_state = SUBSYSTEM4_STATE_INIT;
-
-/* Dual telemetry memory pools & mailbox (Tribunal 1 Change Requirement 1) */
-static ID g_tlm_data_mpf_id = 0;
-static ID g_tlm_fault_mpf_id = 0;
-static ID g_terrain_tlm_mbx_id = 0;
-static bool g_telemetry_initialized = false;
-static uint16_t g_tlm_seq_num = 0U;
-static subsystem4_telemetry_stats_t g_tlm_stats = {0};
-
-/* ==========================================================================
- * RP2040 Hardware Spinlock + Interrupt Save Helpers (Tribunal 1 R1)
- * ========================================================================== */
-
-static uint32_t s4_spinlock_acquire_irqsave(void)
+/* Nothing answered: list every address that does, so the console shows
+   whether it is wiring (nothing at all) or a different chip. */
+LOCAL void i2c_scan_report(void)
 {
-    uint32_t primask;
+	UB a, b;
+	INT found = 0;
 
-    __asm volatile ("mrs %0, PRIMASK\n\t"
-                    "cpsid i"
-                    : "=r" (primask)
-                    :
-                    : "memory");
-    while (RP2040_SIO_SPINLOCK30 == 0U) {
-        /* Spin briefly until core lock is acquired */
-    }
-    __asm volatile ("" ::: "memory");
-    return primask;
+	tm_printf((UB*)"IMU: no known accelerometer found (SDA GP%d, SCL GP%d). I2C scan:",
+		  PIN_IMU_SDA, PIN_IMU_SCL);
+	for (a = 0x08; a < 0x78; a++) {
+		if (i2c_read_regs(a, 0x0F, &b, 1) == E_OK) { tm_printf((UB*)" 0x%02x", a); found++; }
+	}
+	if (found == 0)
+		tm_printf((UB*)" nothing.\n    -> wiring: check SDA/SCL not swapped, VIN and GND connected, the Grove 3 port\n");
+	else
+		tm_printf((UB*)"\n    -> something answers, but not a chip this firmware knows (see the next line)\n");
 }
 
-static void s4_spinlock_release_irqrestore(uint32_t primask)
+EXPORT void imu_get(IMU_STATUS *s) { *s = st; }
+
+/* ---- which accelerometer chip is fitted ----
+   Boards sold as "GY-511" are not all the same chip, so look for each:
+     DLHC/AGR  LSM303DLHC or LSM303AGR: accel 0x19 (or 0x18), mag 0x1E
+     LSM303D   accel + mag in one at 0x1D (or 0x1E), WHO_AM_I 0x0F = 0x49
+     ADXL345   accel only, 0x1D (or 0x53), DEVID 0x00 = 0xE5
+     MMA845x   accel only, 0x1D (or 0x1C), WHO_AM_I 0x0D = 0x1A/0x2A/0x3A */
+enum { CHIP_NONE, CHIP_DLHC, CHIP_LSM303D, CHIP_ADXL345, CHIP_MMA845X };
+LOCAL INT chip = CHIP_NONE;
+LOCAL UB  mag_addr = MAG_ADDR;
+
+/* LSM303D registers */
+#define D_WHO_AM_I	0x0F
+#define D_CTRL1		0x20
+#define D_CTRL2		0x21
+#define D_CTRL5		0x24
+#define D_CTRL6		0x25
+#define D_CTRL7		0x26
+#define D_OUT_X_L_M	0x08
+#define D_OUT_X_L_A	0x28
+/* ADXL345 */
+#define X_DEVID		0x00
+#define X_BW_RATE	0x2C
+#define X_POWER_CTL	0x2D
+#define X_DATA_FORMAT	0x31
+#define X_DATAX0	0x32
+/* MMA845x */
+#define M_OUT_X_MSB	0x01
+#define M_WHO_AM_I	0x0D
+#define M_XYZ_CFG	0x0E
+#define M_CTRL1		0x2A
+
+LOCAL BOOL rd1(UB addr, UB reg, UB *v) { return i2c_read_regs(addr, reg, v, 1) == E_OK; }
+
+LOCAL ER setup_dlhc(void)
 {
-    __asm volatile ("" ::: "memory");
-    RP2040_SIO_SPINLOCK30 = 1U;
-    if ((primask & 0x1U) == 0U) {
-        __asm volatile ("cpsie i" ::: "memory");
-    }
+	UB id;
+	ER er;
+	/* accel: 100 Hz, X/Y/Z on; block update, +-4 g, high resolution */
+	acc_addr = ACC_ADDR;
+	if (i2c_write_reg(acc_addr, CTRL_REG1_A, 0x57) < E_OK) {
+		acc_addr = ACC_ADDR_ALT;
+		if ((er = i2c_write_reg(acc_addr, CTRL_REG1_A, 0x57)) < E_OK) return er;
+	}
+	if ((er = i2c_write_reg(acc_addr, CTRL_REG4_A, 0x98)) < E_OK) return er;
+	mag_type = 0;
+	mag_addr = MAG_ADDR;
+	if (rd1(MAG_ADDR, IRA_REG_M, &id) && id == 0x48) {
+		mag_type = 1;					/* DLHC: 'H' */
+		(void)i2c_write_reg(MAG_ADDR, CRA_REG_M, 0x10);	/* 15 Hz */
+		(void)i2c_write_reg(MAG_ADDR, CRB_REG_M, 0x20);	/* +-1.3 gauss */
+		(void)i2c_write_reg(MAG_ADDR, MR_REG_M, 0x00);	/* continuous */
+	} else if (rd1(MAG_ADDR, WHO_AM_I_M, &id) && id == 0x40) {
+		mag_type = 2;					/* AGR */
+		(void)i2c_write_reg(MAG_ADDR, CFG_REG_A_M, 0x80);	/* temp comp, 10 Hz, continuous */
+		(void)i2c_write_reg(MAG_ADDR, CFG_REG_C_M, 0x10);	/* block update */
+	}
+	chip = CHIP_DLHC;
+	tm_printf((UB*)"IMU found: LSM303DLHC/AGR accelerometer at 0x%02x, magnetometer: %s\n",
+		  acc_addr, mag_type == 1 ? "LSM303DLHC" : mag_type == 2 ? "LSM303AGR" : "not found");
+	return E_OK;
 }
 
-void Subsystem4_Fault_Set_Bits(uint32_t mask)
+LOCAL ER setup_lsm303d(UB addr)
 {
-    uint32_t irq_state = s4_spinlock_acquire_irqsave();
-    g_shared_fault_bitmask |= mask;
-    g_tlm_stats.active_fault_mask = g_shared_fault_bitmask;
-    s4_spinlock_release_irqrestore(irq_state);
+	ER er;
+	acc_addr = mag_addr = addr;
+	if ((er = i2c_write_reg(addr, D_CTRL1, 0x6F)) < E_OK) return er;	/* 100 Hz, block update, XYZ */
+	if ((er = i2c_write_reg(addr, D_CTRL2, 0x08)) < E_OK) return er;	/* +-4 g */
+	(void)i2c_write_reg(addr, D_CTRL5, 0x64);	/* mag high resolution, 6.25 Hz */
+	(void)i2c_write_reg(addr, D_CTRL6, 0x20);	/* mag +-4 gauss */
+	(void)i2c_write_reg(addr, D_CTRL7, 0x00);	/* mag continuous */
+	chip = CHIP_LSM303D;
+	mag_type = 3;
+	tm_printf((UB*)"IMU found: LSM303D (accelerometer + magnetometer) at 0x%02x\n", addr);
+	return E_OK;
 }
 
-void Subsystem4_Fault_Clear_Bits(uint32_t mask)
+LOCAL ER setup_adxl345(UB addr)
 {
-    uint32_t irq_state = s4_spinlock_acquire_irqsave();
-    g_shared_fault_bitmask &= ~mask;
-    g_tlm_stats.active_fault_mask = g_shared_fault_bitmask;
-    s4_spinlock_release_irqrestore(irq_state);
+	ER er;
+	acc_addr = addr;
+	if ((er = i2c_write_reg(addr, X_BW_RATE, 0x0A)) < E_OK) return er;	/* 100 Hz */
+	if ((er = i2c_write_reg(addr, X_DATA_FORMAT, 0x09)) < E_OK) return er;	/* full res, +-4 g */
+	if ((er = i2c_write_reg(addr, X_POWER_CTL, 0x08)) < E_OK) return er;	/* measure */
+	chip = CHIP_ADXL345;
+	mag_type = 0;
+	tm_printf((UB*)"IMU found: ADXL345 accelerometer at 0x%02x (no compass)\n", addr);
+	return E_OK;
 }
 
-uint32_t Subsystem4_Fault_Get_Mask(void)
+LOCAL ER setup_mma845x(UB addr, UB who)
 {
-    uint32_t irq_state = s4_spinlock_acquire_irqsave();
-    uint32_t val = g_shared_fault_bitmask;
-    s4_spinlock_release_irqrestore(irq_state);
-    return val;
+	ER er;
+	acc_addr = addr;
+	if ((er = i2c_write_reg(addr, M_CTRL1, 0x00)) < E_OK) return er;	/* standby to configure */
+	if ((er = i2c_write_reg(addr, M_XYZ_CFG, 0x01)) < E_OK) return er;	/* +-4 g */
+	if ((er = i2c_write_reg(addr, M_CTRL1, 0x19)) < E_OK) return er;	/* 100 Hz, active */
+	chip = CHIP_MMA845X;
+	mag_type = 0;
+	tm_printf((UB*)"IMU found: MMA845x accelerometer (id 0x%02x) at 0x%02x (no compass)\n", who, addr);
+	return E_OK;
 }
 
-void Subsystem4_Update_Odometry_Mm(uint32_t delta_distance_mm)
+LOCAL ER imu_setup(void)
 {
-    uint32_t irq_state = s4_spinlock_acquire_irqsave();
-    g_accumulated_odometry_mm += delta_distance_mm;
-    s4_spinlock_release_irqrestore(irq_state);
+	static const UB alt[] = { 0x1D, 0x1E, 0x53, 0x1C };
+	UB v;
+	UINT i;
+
+	i2c_init();
+	chip = CHIP_NONE;
+	mag_type = 0;
+	if (setup_dlhc() == E_OK) return E_OK;
+	for (i = 0; i < sizeof alt; i++) {
+		UB a = alt[i];
+		if ((a == 0x1D || a == 0x1E) && rd1(a, D_WHO_AM_I, &v) && v == 0x49) return setup_lsm303d(a);
+		if ((a == 0x1D || a == 0x53) && rd1(a, X_DEVID, &v) && v == 0xE5) return setup_adxl345(a);
+		if ((a == 0x1D || a == 0x1C) && rd1(a, M_WHO_AM_I, &v) &&
+		    (v == 0x1A || v == 0x2A || v == 0x3A || v == 0x4A || v == 0x5A)) return setup_mma845x(a, v);
+	}
+	if ((setup_tries++ % 10U) == 0) {			/* every ~10 s */
+		i2c_scan_report();
+		/* say what an unknown chip answers, so it can be added */
+		for (i = 0; i < sizeof alt; i++) {
+			UB a = alt[i], w0f = 0, w00 = 0, w0d = 0;
+			BOOL ok = rd1(a, 0x0F, &w0f);
+			if (!ok) continue;
+			(void)rd1(a, 0x00, &w00);
+			(void)rd1(a, 0x0D, &w0d);
+			tm_printf((UB*)"    chip at 0x%02x: reg 0x0F = 0x%02x, reg 0x00 = 0x%02x, reg 0x0D = 0x%02x"
+				  " (send this line to identify it)\n", a, w0f, w00, w0d);
+		}
+	}
+	return E_NOEXS;
 }
 
-uint32_t Subsystem4_Consume_Odometry_Mm(void)
+LOCAL ER read_accel(INT a[3])
 {
-    uint32_t irq_state = s4_spinlock_acquire_irqsave();
-    uint32_t mm = g_accumulated_odometry_mm;
-    g_accumulated_odometry_mm = 0U;
-    s4_spinlock_release_irqrestore(irq_state);
-    return mm;
+	UB b[6];
+	INT i;
+	ER er;
+
+	switch (chip) {
+	case CHIP_DLHC:		/* 12 bit left-justified, +-4 g high res: 2 mg per count */
+		if ((er = i2c_read_regs(acc_addr, OUT_X_L_A | AUTO_INC, b, 6)) < E_OK) return er;
+		for (i = 0; i < 3; i++) a[i] = ((INT)(H)(b[2 * i] | (b[2 * i + 1] << 8)) >> 4) * 2;
+		break;
+	case CHIP_LSM303D:	/* 16 bit, +-4 g: 0.122 mg per count */
+		if ((er = i2c_read_regs(acc_addr, D_OUT_X_L_A | AUTO_INC, b, 6)) < E_OK) return er;
+		for (i = 0; i < 3; i++) a[i] = ((INT)(H)(b[2 * i] | (b[2 * i + 1] << 8)) * 122) / 1000;
+		break;
+	case CHIP_ADXL345:	/* full resolution: 3.9 mg per count, low byte first */
+		if ((er = i2c_read_regs(acc_addr, X_DATAX0, b, 6)) < E_OK) return er;
+		for (i = 0; i < 3; i++) a[i] = ((INT)(H)(b[2 * i] | (b[2 * i + 1] << 8)) * 39) / 10;
+		break;
+	case CHIP_MMA845X:	/* 12 bit left-justified, high byte first, +-4 g: 512 per g */
+		if ((er = i2c_read_regs(acc_addr, M_OUT_X_MSB, b, 6)) < E_OK) return er;
+		for (i = 0; i < 3; i++) a[i] = (((INT)(H)((b[2 * i] << 8) | b[2 * i + 1]) >> 4) * 1000) / 512;
+		break;
+	default:
+		return E_NOEXS;
+	}
+	return E_OK;
 }
 
-/* ==========================================================================
- * Math & Utility Helpers
- * ========================================================================== */
-
-static float wrap_degrees(float angle_deg)
+LOCAL ER read_mag(INT m[3])
 {
-    while (angle_deg > 180.0f) {
-        angle_deg -= 360.0f;
-    }
-    while (angle_deg < -180.0f) {
-        angle_deg += 360.0f;
-    }
-    return angle_deg;
+	UB b[6];
+	ER er;
+
+	if (mag_type == 1) {				/* X, Z, Y, high byte first */
+		if ((er = i2c_read_regs(MAG_ADDR, OUT_X_H_M, b, 6)) < E_OK) return er;
+		m[0] = (H)((b[0] << 8) | b[1]);
+		m[2] = (H)((b[2] << 8) | b[3]);
+		m[1] = (H)((b[4] << 8) | b[5]);
+	} else if (mag_type == 2) {			/* X, Y, Z, low byte first */
+		if ((er = i2c_read_regs(MAG_ADDR, OUTX_L_REG_M | AUTO_INC, b, 6)) < E_OK) return er;
+		m[0] = (H)(b[0] | (b[1] << 8));
+		m[1] = (H)(b[2] | (b[3] << 8));
+		m[2] = (H)(b[4] | (b[5] << 8));
+	} else if (mag_type == 3) {			/* LSM303D: X, Y, Z, low byte first */
+		if ((er = i2c_read_regs(mag_addr, D_OUT_X_L_M | AUTO_INC, b, 6)) < E_OK) return er;
+		m[0] = (H)(b[0] | (b[1] << 8));
+		m[1] = (H)(b[2] | (b[3] << 8));
+		m[2] = (H)(b[4] | (b[5] << 8));
+	} else return E_NOEXS;
+	return E_OK;
 }
 
-static uint32_t clamp_u32(int32_t val, int32_t min_val, int32_t max_val)
+LOCAL void imu_task(INT stacd, void *exinf)
 {
-    if (val < min_val) {
-        return (uint32_t)min_val;
-    }
-    if (val > max_val) {
-        return (uint32_t)max_val;
-    }
-    return (uint32_t)val;
+	HUMP hump;
+	INT f[3] = {0, 0, 1000};		/* filtered accel, mg */
+	INT lvl_p = 0, lvl_r = 0;		/* learned level, 0.1 deg */
+	INT fails = 0, n = 0;
+	UW tilt_t0 = 0, impact_t = 0, ev_t[3] = {0, 0, 0};
+	BOOL tilted = FALSE, have_level = FALSE;
+	UINT lift_hist = 0;
+	UW lift_t = 0;
+	W odo_last = 0;
+
+	(void)stacd; (void)exinf;
+	hump_reset(&hump);
+	st.heading = -1;
+	while (imu_setup() < E_OK) {
+		fault_raise(FAULT_IMU);
+		tk_dly_tsk(1000);
+	}
+	fault_clear(FAULT_IMU);
+	st.ok = TRUE;
+
+	for (;; n++) {
+		INT a[3], fwd, left, up, pitch, roll, mag_g;
+		UW t;
+		UINT i;
+
+		tk_dly_tsk(IMU_PERIOD_MS);
+		t = now_ms();
+
+		if (read_accel(a) < E_OK) {
+			if (++fails >= 5) {			/* ~100 ms of silence */
+				st.ok = FALSE;
+				fault_raise(FAULT_IMU);
+				tk_dly_tsk(1000);
+				if (imu_setup() == E_OK) { fails = 0; st.ok = TRUE; fault_clear(FAULT_IMU); }
+			}
+			continue;
+		}
+		fails = 0;
+
+		/* impact: on the raw sample, before smoothing */
+		mag_g = (INT)imu_isqrt((UW)(a[0] * a[0] + a[1] * a[1] + a[2] * a[2]));
+		st.shock_mg = ABS(mag_g - 1000);
+		if (st.shock_mg > IMU_IMPACT_MG && (t - impact_t) > 500U) {
+			impact_t = t;
+			ev_t[1] = t;
+			st.events |= IMU_EV_IMPACT;
+			st.seq++;
+			fault_raise(FAULT_IMPACT);
+			tm_printf((UB*)"IMU impact %d mg\n", st.shock_mg);
+		}
+		if (impact_t && (t - impact_t) > 3000U) { fault_clear(FAULT_IMPACT); impact_t = 0; }
+
+		/* picked up: sustained push above 1 g */
+		{
+			UINT k, h;
+			lift_hist = ((lift_hist << 1) | (mag_g - 1000 > IMU_LIFT_MG ? 1U : 0U)) &
+				    ((1U << IMU_LIFT_WIN) - 1U);
+			for (h = lift_hist, k = 0; h; h >>= 1) k += h & 1U;
+			if (k >= IMU_LIFT_HITS && n > IMU_SETTLE_SAMPLES && (t - lift_t) > 1000U) {
+				lift_t = t;
+				mission_event(EV_LIFT);
+				tm_printf((UB*)"IMU lift: %d mg above 1 g on %d of %d samples\n",
+					  mag_g - 1000, (INT)k, IMU_LIFT_WIN);
+			}
+		}
+
+		for (i = 0; i < 3; i++) f[i] += (a[i] - f[i]) / 4;	/* smoothing */
+		st.ax = f[0]; st.ay = f[1]; st.az = f[2];
+		/* mounted upside down?  (IS27: the board reads -1 g on Z.)
+		   Decided once, after 0.5 s of smoothing: gravity pointing
+		   "down" on the up axis = flip up AND left (a 180 deg turn
+		   about the forward axis), so roll reads 0, not 180 deg. */
+		if (n == IMU_SETTLE_SAMPLES && up_sign * f[IMU_UP_AXIS] < -500) {
+			up_sign = -up_sign;
+			left_sign = -left_sign;
+			tm_printf((UB*)"IMU is mounted upside down (up axis %d mg): flipping up and left axes\n",
+				  f[IMU_UP_AXIS]);
+		}
+		fwd  = IMU_FWD_SIGN * f[IMU_FWD_AXIS];
+		left = left_sign    * f[IMU_LEFT_AXIS];
+		up   = up_sign      * f[IMU_UP_AXIS];
+		pitch = imu_atan2_d10(fwd, (INT)imu_isqrt((UW)(left * left + up * up)));
+		roll  = imu_atan2_d10(left, up);
+
+		/* level: learnt while parked, steady and NOT being moved, and
+		   only small corrections (under 3 deg).  So a car pushed by
+		   hand over a hump, or set down on a ramp, still reads the
+		   slope instead of "learning" it away within a second. */
+		{
+			W odo = motion_odometry_mm();
+			BOOL still = (odo == odo_last);
+			odo_last = odo;
+			if (!have_level) {
+				/* first level: after the smoothing has settled and
+				   the orientation is known (not from sample 1, which
+				   started from a made-up 0, 0, 1 g) */
+				if (n < IMU_SETTLE_SAMPLES + 5) continue;
+				lvl_p = pitch; lvl_r = roll; have_level = TRUE;
+				tm_printf((UB*)"IMU level learnt: pitch %d roll %d (0.1 deg) = 0\n", pitch, roll);
+			} else if (mission_state() == MS_IDLE && st.shock_mg < 60 && still &&
+				 ABS(pitch - lvl_p) < 30 && ABS(roll - lvl_r) < 30) {
+				lvl_p += (pitch - lvl_p) / 16;
+				lvl_r += (roll - lvl_r) / 16;
+			}
+		}
+		st.pitch_d10 = pitch - lvl_p;
+		st.roll_d10  = roll - lvl_r;
+
+		/* hump */
+		{
+			int32_t h_mm, r;
+			r = hump_step(&hump, &hump_tune, st.pitch_d10, (INT)motion_odometry_mm(), t, &h_mm);
+			if (r) {
+				st.humps++;
+				st.hump_mm = (INT)h_mm;
+				st.events |= IMU_EV_HUMP;
+				ev_t[0] = t;
+				st.seq++;
+				tm_printf((UB*)"IMU %s #%d, %d mm %s\n", r == 1 ? "hump / ramp up" : "ramp down",
+					  (INT)st.humps, (INT)h_mm, r == 1 ? "high" : "drop");
+			}
+		}
+
+		/* tilt: tipped over or picked up */
+		if (ABS(st.pitch_d10) > IMU_TILT_D10 || ABS(st.roll_d10) > IMU_TILT_D10) {
+			if (tilt_t0 == 0) tilt_t0 = t;
+			if (!tilted && (t - tilt_t0) > IMU_TILT_MS) {
+				tilted = TRUE;
+				st.events |= IMU_EV_TILT;
+				ev_t[2] = t;
+				st.seq++;
+				mission_event(EV_TILT);
+				tm_printf((UB*)"IMU tilt: pitch %d roll %d (0.1 deg)\n", st.pitch_d10, st.roll_d10);
+			}
+		} else {
+			tilt_t0 = 0;
+			tilted = FALSE;
+		}
+
+		/* event bits fade after a second (they ride on robot/tlm/terrain) */
+		for (i = 0; i < 3; i++)
+			if ((st.events & (1U << i)) && (t - ev_t[i]) > IMU_EVENT_SHOW_MS) st.events &= ~(1U << i);
+
+		/* compass, 10 Hz (uncalibrated: close to the motors it is rough) */
+		if ((n % 5) == 0 && mag_type) {
+			INT m[3];
+			if (read_mag(m) == E_OK) {
+				INT mf = IMU_FWD_SIGN * m[IMU_FWD_AXIS], ml = left_sign * m[IMU_LEFT_AXIS];
+				INT hd = imu_atan2_d10(-ml, mf) / 10;	/* clockwise from north */
+				st.heading = hd < 0 ? hd + 360 : hd;
+			}
+		}
+	}
 }
 
-static void write_le32(uint8_t *p_buf, uint32_t word)
+EXPORT ER subsystem4_init(void) { return E_OK; }	/* no kernel objects */
+
+EXPORT ER subsystem4_start(void)
 {
-    p_buf[0] = (uint8_t)(word & 0xFFU);
-    p_buf[1] = (uint8_t)((word >> 8) & 0xFFU);
-    p_buf[2] = (uint8_t)((word >> 16) & 0xFFU);
-    p_buf[3] = (uint8_t)((word >> 24) & 0xFFU);
+	ID tid = app_start_task((FP)imu_task, PRI_IMU, CORE_IMU, "imu");
+	return tid < E_OK ? tid : E_OK;
 }
 
-static uint32_t read_le32(const uint8_t *p_buf)
-{
-    return ((uint32_t)p_buf[0]) |
-           (((uint32_t)p_buf[1]) << 8) |
-           (((uint32_t)p_buf[2]) << 16) |
-           (((uint32_t)p_buf[3]) << 24);
-}
-
-/* ==========================================================================
- * Lifecycle & Calibration
- * ========================================================================== */
-
-ER subsystem4_init(void)
-{
-    Subsystem4_Init();
-    return Subsystem4_Telemetry_Init();
-}
-
-ER subsystem4_start(void)
-{
-    extern ID Subsystem4_Start_Sensor_Task(void);
-    ID task_id = Subsystem4_Start_Sensor_Task();
-
-    return (task_id > 0) ? E_OK : (ER)task_id;
-}
-
-void Subsystem4_Init(void)
-{
-    g_filter_alpha = SUBSYSTEM4_DEFAULT_FILTER_ALPHA;
-    g_raw_lpf_beta = SUBSYSTEM4_DEFAULT_RAW_LPF_BETA;
-    g_raw_lpf_initialized = false;
-    g_ax_lpf_g = 0.0f;
-    g_ay_lpf_g = 0.0f;
-    g_az_lpf_g = 1.0f;
-
-    g_pitch_filtered_deg = 0.0f;
-    g_roll_filtered_deg = 0.0f;
-    g_previous_heading_deg = 0.0f;
-    g_heading_initialized = false;
-
-    g_prev_pitch_rad = 0.0f;
-    g_integrated_height_cm = 0.0f;
-    g_current_hump_peak_cm = 0.0f;
-    g_peak_hump_height_cm = 0.0f;
-    g_last_hump_height_cm = 0.0f;
-    g_pre_entry_height_cm = 0.0f;
-    g_hump_entry_streak = 0U;
-    g_hump_count = 0U;
-    g_hump_active = false;
-    g_estimated_vel_mm_s = 0.0f;
-
-    Subsystem4_Fault_Clear_Bits(0xFFFFFFFFUL);
-    (void)Subsystem4_Consume_Odometry_Mm();
-
-    g_abort_requested = false;
-    g_operational_state = SUBSYSTEM4_STATE_INIT;
-
-    if (!g_calibration.is_calibrated) {
-        g_calibration.accel_x_offset_g = 0.0f;
-        g_calibration.accel_y_offset_g = 0.0f;
-        g_calibration.accel_z_offset_g = 0.0f;
-    }
-}
-
-bool Subsystem4_Calibrate(uint32_t timeout_ms)
-{
-    if ((timeout_ms == 0U) ||
-        (timeout_ms > SUBSYSTEM4_IMU_INIT_TIMEOUT_MS)) {
-        Subsystem4_Fault_Set_Bits(SYS_FAULT_BIT_IMU_CALIB);
-        return false;
-    }
-
-    g_calibration.accel_x_offset_g = 0.0f;
-    g_calibration.accel_y_offset_g = 0.0f;
-    g_calibration.accel_z_offset_g = 0.0f;
-    g_calibration.is_calibrated = true;
-    Subsystem4_Fault_Clear_Bits(SYS_FAULT_BIT_IMU_CALIB);
-    g_operational_state = SUBSYSTEM4_STATE_FLAT_TRACKING;
-    return true;
-}
-
-bool Subsystem4_Calibrate_From_Sensor(uint32_t timeout_ms)
-{
-    gy511_raw_sample_t sample;
-    float ax_sum = 0.0f;
-    float ay_sum = 0.0f;
-    float az_sum = 0.0f;
-    uint32_t sample_count;
-    uint32_t index;
-
-    if ((timeout_ms < 100U) ||
-        (timeout_ms > SUBSYSTEM4_IMU_INIT_TIMEOUT_MS) ||
-        !GY511_IsReady()) {
-        Subsystem4_Fault_Set_Bits(SYS_FAULT_BIT_IMU_CALIB);
-        return false;
-    }
-
-    sample_count = timeout_ms / SUBSYSTEM4_SAMPLE_PERIOD_MS;
-    if (sample_count > 100U) {
-        sample_count = 100U;
-    }
-    if (sample_count < 10U) {
-        sample_count = 10U;
-    }
-
-    for (index = 0U; index < sample_count; ++index) {
-        if (!GY511_ReadRawSample(&sample)) {
-            Subsystem4_Fault_Set_Bits(SYS_FAULT_BIT_IMU_I2C | SYS_FAULT_BIT_IMU_CALIB);
-            return false;
-        }
-
-        ax_sum += (float)sample.accel_x * SUBSYSTEM4_GY511_ACCEL_RAW_TO_G;
-        ay_sum += (float)sample.accel_y * SUBSYSTEM4_GY511_ACCEL_RAW_TO_G;
-        az_sum += (float)sample.accel_z * SUBSYSTEM4_GY511_ACCEL_RAW_TO_G;
-
-        if ((index + 1U) < sample_count) {
-            (void)tk_dly_tsk(SUBSYSTEM4_SAMPLE_PERIOD_MS);
-        }
-    }
-
-    g_calibration.accel_x_offset_g = 0.008f;
-    g_calibration.accel_y_offset_g = 0.021f;
-    g_calibration.accel_z_offset_g = -1.934f;
-    g_calibration.is_calibrated = true;
-
-    g_raw_lpf_initialized = false;
-    g_pitch_filtered_deg = 0.0f;
-    g_roll_filtered_deg = 0.0f;
-    g_heading_initialized = false;
-    Subsystem4_Fault_Clear_Bits(SYS_FAULT_BIT_IMU_CALIB | SYS_FAULT_BIT_IMU_I2C);
-    g_operational_state = SUBSYSTEM4_STATE_FLAT_TRACKING;
-    return true;
-}
-
-void Subsystem4_Set_Filter_Alpha(float alpha)
-{
-    if ((alpha >= 0.0f) && (alpha <= 1.0f)) {
-        g_filter_alpha = alpha;
-    }
-}
-
-void Subsystem4_Set_Raw_LPF_Beta(float beta)
-{
-    if ((beta > 0.0f) && (beta <= 1.0f)) {
-        g_raw_lpf_beta = beta;
-    }
-}
-
-const imu_calibration_offsets_t *Subsystem4_Get_Calibration(void)
-{
-    return &g_calibration;
-}
-
-/* ==========================================================================
- * Stage 2: Raw Accel LPF + Complementary Attitude Filter
- * ========================================================================== */
-
-void Subsystem4_Filter_Step(const imu_raw_sample_t *p_raw_sample,
-                            imu_filtered_data_t *p_filtered_data)
-{
-    float raw_ax_g;
-    float raw_ay_g;
-    float raw_az_g;
-    float accel_x_g;
-    float accel_y_g;
-    float accel_z_g;
-    float pitch_accel_deg;
-    float roll_accel_deg;
-    float heading_deg;
-    float mag_x;
-    float mag_y;
-
-    if ((p_raw_sample == (const imu_raw_sample_t *)0) ||
-        (p_filtered_data == (imu_filtered_data_t *)0)) {
-        return;
-    }
-
-    raw_ax_g = ((float)p_raw_sample->accel_x *
-                SUBSYSTEM4_GY511_ACCEL_RAW_TO_G) -
-               g_calibration.accel_x_offset_g;
-    raw_ay_g = ((float)p_raw_sample->accel_y *
-                SUBSYSTEM4_GY511_ACCEL_RAW_TO_G) -
-               g_calibration.accel_y_offset_g;
-    raw_az_g = ((float)p_raw_sample->accel_z *
-                SUBSYSTEM4_GY511_ACCEL_RAW_TO_G) -
-               g_calibration.accel_z_offset_g;
-
-    /*
-     * Assumption A6.1 Mitigation: Software low-pass filter on raw accelerometer
-     * samples to suppress high-frequency motor vibration before atan2f().
-     * Sudden impacts (> 2.5g) bypass LPF damping on magnitude so impact
-     * detection stays instantaneous (< 1 sample latency).
-     */
-    if (!g_raw_lpf_initialized) {
-        g_ax_lpf_g = raw_ax_g;
-        g_ay_lpf_g = raw_ay_g;
-        g_az_lpf_g = raw_az_g;
-        g_raw_lpf_initialized = true;
-    } else {
-        g_ax_lpf_g = ((1.0f - g_raw_lpf_beta) * g_ax_lpf_g) + (g_raw_lpf_beta * raw_ax_g);
-        g_ay_lpf_g = ((1.0f - g_raw_lpf_beta) * g_ay_lpf_g) + (g_raw_lpf_beta * raw_ay_g);
-        g_az_lpf_g = ((1.0f - g_raw_lpf_beta) * g_az_lpf_g) + (g_raw_lpf_beta * raw_az_g);
-    }
-
-    accel_x_g = g_ax_lpf_g;
-    accel_y_g = g_ay_lpf_g;
-    accel_z_g = g_az_lpf_g;
-
-    pitch_accel_deg = atan2f(-accel_x_g,
-        sqrtf((accel_y_g * accel_y_g) + (accel_z_g * accel_z_g))) *
-        SUBSYSTEM4_RAD_TO_DEG;
-    roll_accel_deg = atan2f(accel_y_g, accel_z_g) * SUBSYSTEM4_RAD_TO_DEG;
-
-    g_pitch_filtered_deg = (g_filter_alpha * g_pitch_filtered_deg) +
-        ((1.0f - g_filter_alpha) * pitch_accel_deg);
-    g_roll_filtered_deg = (g_filter_alpha * g_roll_filtered_deg) +
-        ((1.0f - g_filter_alpha) * roll_accel_deg);
-
-    mag_x = (float)p_raw_sample->mag_x;
-    mag_y = (float)p_raw_sample->mag_y;
-    heading_deg = atan2f(mag_y, mag_x) * SUBSYSTEM4_RAD_TO_DEG;
-
-    p_filtered_data->pitch_deg = g_pitch_filtered_deg;
-    p_filtered_data->roll_deg = g_roll_filtered_deg;
-    /* Use unfiltered raw vector for impact magnitude so 20 ms deadline is preserved */
-    p_filtered_data->accel_magnitude_g = sqrtf(
-        (raw_ax_g * raw_ax_g) +
-        (raw_ay_g * raw_ay_g) +
-        (raw_az_g * raw_az_g));
-    p_filtered_data->forward_accel_g = accel_x_g +
-        sinf(g_pitch_filtered_deg * SUBSYSTEM4_DEG_TO_RAD);
-    p_filtered_data->heading_deg = heading_deg;
-    p_filtered_data->heading_valid =
-        !((p_raw_sample->mag_x == 0) &&
-          (p_raw_sample->mag_y == 0) &&
-          (p_raw_sample->mag_z == 0));
-
-    if (p_filtered_data->heading_valid && g_heading_initialized) {
-        p_filtered_data->yaw_rate_deg_s =
-            wrap_degrees(heading_deg - g_previous_heading_deg) /
-            ((float)SUBSYSTEM4_SAMPLE_PERIOD_MS / 1000.0f);
-    } else {
-        p_filtered_data->yaw_rate_deg_s = 0.0f;
-    }
-
-    if (p_filtered_data->heading_valid) {
-        g_previous_heading_deg = heading_deg;
-        g_heading_initialized = true;
-    }
-    p_filtered_data->timestamp_ms = p_raw_sample->timestamp_ms;
-}
-
-/* ==========================================================================
- * Stage 3: Hump Height Integration, Impact Detection & State Machine
- * ========================================================================== */
-
-void Subsystem4_Terrain_Step(const imu_filtered_data_t *p_filtered_data,
-                             uint32_t delta_distance_mm,
-                             terrain_state_t *p_terrain_state)
-{
-    float dt_s = (float)SUBSYSTEM4_SAMPLE_PERIOD_MS / 1000.0f;
-    float effective_distance_mm;
-    float delta_distance_cm;
-    float pitch_rad;
-    float avg_pitch_rad;
-    float step_dh_cm;
-    motion_class_t previous_motion_state;
-
-    if ((p_filtered_data == (const imu_filtered_data_t *)0) ||
-        (p_terrain_state == (terrain_state_t *)0)) {
-        return;
-    }
-
-    previous_motion_state = p_terrain_state->motion_state;
-    p_terrain_state->current_pitch = p_filtered_data->pitch_deg;
-    p_terrain_state->current_roll = p_filtered_data->roll_deg;
-    p_terrain_state->yaw_rate_deg_s = p_filtered_data->yaw_rate_deg_s;
-    p_terrain_state->sudden_impact_flag = false;
-    p_terrain_state->event_flags = 0U;
-
-    /* 1. Immediate Emergency Impact Path (20 ms Handoff Requirement) */
-    if (p_filtered_data->accel_magnitude_g >
-        SUBSYSTEM4_IMPACT_ACCEL_THRESHOLD_G) {
-        p_terrain_state->sudden_impact_flag = true;
-        p_terrain_state->motion_state = MOTION_CLASS_SUDDEN_IMPACT;
-        p_terrain_state->current_height_cm = g_integrated_height_cm;
-        p_terrain_state->peak_height_cm = g_peak_hump_height_cm;
-        p_terrain_state->last_hump_height_cm = g_last_hump_height_cm;
-        p_terrain_state->hump_active = g_hump_active;
-        p_terrain_state->hump_count = g_hump_count;
-        p_terrain_state->event_flags |= SUBSYSTEM4_EVT_SUDDEN_IMPACT;
-
-        /* Atomically set Bit 3 in shared fault bitmask */
-        Subsystem4_Fault_Set_Bits(SYS_FAULT_BIT_SUDDEN_IMPACT);
-
-        if (g_telemetry_initialized) {
-            (void)Subsystem4_Telemetry_Send_Fault(
-                Subsystem4_Fault_Get_Mask(),
-                p_filtered_data->timestamp_ms,
-                (int16_t)(p_filtered_data->accel_magnitude_g * 1000.0f));
-        }
-
-        g_operational_state = SUBSYSTEM4_STATE_ABORT_RESET;
-        return;
-    }
-
-    /* Check excessive tilt alert threshold */
-    if ((fabsf(p_filtered_data->pitch_deg) >= SUBSYSTEM4_ALERT_PITCH_DEG) ||
-        (fabsf(p_filtered_data->roll_deg) >= SUBSYSTEM4_ALERT_PITCH_DEG)) {
-        p_terrain_state->event_flags |= SUBSYSTEM4_EVT_TILT;
-        Subsystem4_Fault_Set_Bits(SYS_FAULT_BIT_TILT_ALERT);
-    } else {
-        Subsystem4_Fault_Clear_Bits(SYS_FAULT_BIT_TILT_ALERT);
-    }
-
-    /* 2. Motion State Classification */
-    if (p_filtered_data->heading_valid &&
-        (fabsf(p_filtered_data->yaw_rate_deg_s) > 15.0f)) {
-        p_terrain_state->motion_state = MOTION_CLASS_TURNING;
-    } else if (p_filtered_data->pitch_deg > SUBSYSTEM4_HUMP_ENTRY_PITCH_DEG) {
-        p_terrain_state->motion_state = MOTION_CLASS_CLIMBING;
-    } else if (p_filtered_data->pitch_deg < -SUBSYSTEM4_HUMP_ENTRY_PITCH_DEG) {
-        p_terrain_state->motion_state = MOTION_CLASS_DESCENDING;
-    } else if (fabsf(p_filtered_data->accel_magnitude_g - 1.0f) > 0.15f) {
-        p_terrain_state->motion_state = MOTION_CLASS_ACCELERATING;
-    } else {
-        p_terrain_state->motion_state = MOTION_CLASS_STATIONARY;
-    }
-
-    /* 3. Resolve Travel Distance (Buddy 2 Odometry or Kinematic Fallback) */
-    if (delta_distance_mm > 0U) {
-        effective_distance_mm = (float)delta_distance_mm;
-        g_estimated_vel_mm_s = effective_distance_mm / dt_s;
-    } else {
-        uint32_t queued_mm = Subsystem4_Consume_Odometry_Mm();
-        if (queued_mm > 0U) {
-            effective_distance_mm = (float)queued_mm;
-            g_estimated_vel_mm_s = effective_distance_mm / dt_s;
-        } else if (fabsf(p_filtered_data->forward_accel_g) > 0.03f) {
-            g_estimated_vel_mm_s +=
-                (p_filtered_data->forward_accel_g * SUBSYSTEM4_GRAVITY_MM_S2) * dt_s;
-            if (g_estimated_vel_mm_s < 0.0f) {
-                g_estimated_vel_mm_s = 0.0f;
-            }
-            effective_distance_mm = g_estimated_vel_mm_s * dt_s;
-        } else {
-            g_estimated_vel_mm_s *= 0.90f;
-            effective_distance_mm = 0.0f;
-        }
-    }
-
-    delta_distance_cm = effective_distance_mm / 10.0f;
-    pitch_rad = p_filtered_data->pitch_deg * SUBSYSTEM4_DEG_TO_RAD;
-    avg_pitch_rad = 0.5f * (g_prev_pitch_rad + pitch_rad);
-    step_dh_cm = delta_distance_cm * sinf(avg_pitch_rad);
-    g_prev_pitch_rad = pitch_rad;
-
-    /* 4. Hump Profile Integration with A6.3 Persistence Filter */
-    if (!g_hump_active) {
-        if (p_filtered_data->pitch_deg >= SUBSYSTEM4_HUMP_ENTRY_PITCH_DEG) {
-            ++g_hump_entry_streak;
-            /* Buffer pre-entry height so initial ramp climb is never lost */
-            g_pre_entry_height_cm += delta_distance_cm * sinf(pitch_rad);
-
-            if (g_hump_entry_streak >= SUBSYSTEM4_HUMP_ENTRY_MIN_SAMPLES) {
-                g_hump_active = true;
-                g_integrated_height_cm = g_pre_entry_height_cm;
-                g_current_hump_peak_cm = g_integrated_height_cm;
-                if (g_current_hump_peak_cm > g_peak_hump_height_cm) {
-                    g_peak_hump_height_cm = g_current_hump_peak_cm;
-                }
-                g_pre_entry_height_cm = 0.0f;
-                g_operational_state = SUBSYSTEM4_STATE_HUMP_PROCESSING;
-            }
-        } else {
-            g_hump_entry_streak = 0U;
-            g_pre_entry_height_cm = 0.0f;
-            g_operational_state = SUBSYSTEM4_STATE_FLAT_TRACKING;
-        }
-    } else {
-        /* Inside active hump: integrate climb and descent trapezoidally */
-        if (fabsf(p_filtered_data->pitch_deg) >= SUBSYSTEM4_HUMP_EXIT_PITCH_DEG) {
-            g_integrated_height_cm += step_dh_cm;
-            if (g_integrated_height_cm < 0.0f) {
-                g_integrated_height_cm = 0.0f;
-            }
-            if (g_integrated_height_cm > g_current_hump_peak_cm) {
-                g_current_hump_peak_cm = g_integrated_height_cm;
-            }
-            if (g_current_hump_peak_cm > g_peak_hump_height_cm) {
-                g_peak_hump_height_cm = g_current_hump_peak_cm;
-            }
-            g_operational_state = SUBSYSTEM4_STATE_HUMP_PROCESSING;
-        } else {
-            /* Level ground re-entered: finalize hump height & dispatch telemetry */
-            g_hump_active = false;
-            g_hump_entry_streak = 0U;
-            g_pre_entry_height_cm = 0.0f;
-            g_last_hump_height_cm = g_current_hump_peak_cm;
-            g_peak_hump_height_cm = g_current_hump_peak_cm;
-            g_integrated_height_cm = 0.0f;
-            ++g_hump_count;
-            g_operational_state = SUBSYSTEM4_STATE_TELEMETRY_DISPATCH;
-            p_terrain_state->event_flags |= SUBSYSTEM4_EVT_HUMP_EXIT;
-        }
-    }
-
-    if (p_terrain_state->motion_state != previous_motion_state) {
-        p_terrain_state->event_flags |= SUBSYSTEM4_EVT_STATE_CHANGE;
-        if (!g_hump_active) {
-            g_operational_state = SUBSYSTEM4_STATE_TELEMETRY_DISPATCH;
-        }
-    }
-
-    p_terrain_state->current_height_cm = g_integrated_height_cm;
-    p_terrain_state->peak_height_cm = g_peak_hump_height_cm;
-    p_terrain_state->last_hump_height_cm = g_last_hump_height_cm;
-    p_terrain_state->hump_active = g_hump_active;
-    p_terrain_state->hump_count = g_hump_count;
-
-    /* Automatically enqueue binary telemetry on state change or hump exit */
-    if (g_telemetry_initialized &&
-        ((p_terrain_state->event_flags &
-          (SUBSYSTEM4_EVT_STATE_CHANGE | SUBSYSTEM4_EVT_HUMP_EXIT | SUBSYSTEM4_EVT_TILT)) != 0U)) {
-        (void)Subsystem4_Telemetry_Send_State(p_terrain_state,
-                                              p_filtered_data->timestamp_ms);
-    }
-}
-
-void Subsystem4_Reset_Watchdog_Recover(void)
-{
-    /* Static calibration deliberately survives software recovery (Buddy 4 V-A #5) */
-    g_raw_lpf_initialized = false;
-    g_pitch_filtered_deg = 0.0f;
-    g_roll_filtered_deg = 0.0f;
-    g_heading_initialized = false;
-    g_prev_pitch_rad = 0.0f;
-    g_integrated_height_cm = 0.0f;
-    g_current_hump_peak_cm = 0.0f;
-    g_pre_entry_height_cm = 0.0f;
-    g_hump_entry_streak = 0U;
-    g_hump_active = false;
-    g_abort_requested = false;
-    Subsystem4_Fault_Clear_Bits(SYS_FAULT_BIT_SUDDEN_IMPACT | SYS_FAULT_BIT_TILT_ALERT);
-    g_operational_state = g_calibration.is_calibrated ?
-        SUBSYSTEM4_STATE_FLAT_TRACKING : SUBSYSTEM4_STATE_INIT;
-}
-
-void Subsystem4_Request_Abort_Reset(void)
-{
-    g_abort_requested = true;
-    g_operational_state = SUBSYSTEM4_STATE_ABORT_RESET;
-}
-
-subsystem4_operational_state_t Subsystem4_Get_Operational_State(void)
-{
-    return g_operational_state;
-}
-
-/* ==========================================================================
- * Explicit Bit-Mask & Shift Binary Telemetry Packing (Tribunal 1 CR1)
- * ========================================================================== */
-
-void Subsystem4_Pack_Telemetry(const terrain_state_t *p_terrain,
-                               uint32_t timestamp_ms,
-                               uint8_t out_bytes[SUBSYSTEM4_TLM_PAYLOAD_BYTES])
-{
-    uint32_t word0 = 0U;
-    uint32_t word1 = 0U;
-    int32_t pitch_tenths;
-    int32_t roll_tenths;
-    int32_t height_mm;
-    uint32_t pitch_enc;
-    uint32_t roll_enc;
-    uint32_t height_enc;
-    uint32_t fault_low4;
-
-    if ((p_terrain == (const terrain_state_t *)0) ||
-        (out_bytes == (uint8_t *)0)) {
-        return;
-    }
-
-    fault_low4 = Subsystem4_Fault_Get_Mask() & 0x0FU;
-
-    word0 |= ((uint32_t)SUBSYSTEM4_MSG_TYPE_TERRAIN_TLM & 0x07U) << 0;
-    word0 |= (timestamp_ms & 0xFFFFFU) << 3;
-    word0 |= ((uint32_t)p_terrain->motion_state & 0x07U) << 23;
-    word0 |= (p_terrain->hump_active ? 1UL : 0UL) << 26;
-    word0 |= (p_terrain->sudden_impact_flag ? 1UL : 0UL) << 27;
-    word0 |= (fault_low4 & 0x0FU) << 28;
-
-    /* Use roundf to avoid floating-point truncation errors during scale conversion */
-    pitch_tenths = (int32_t)roundf(p_terrain->current_pitch * 10.0f);
-    roll_tenths  = (int32_t)roundf(p_terrain->current_roll * 10.0f);
-    height_mm    = (int32_t)roundf(p_terrain->peak_height_cm * 10.0f);
-
-    pitch_enc = clamp_u32(pitch_tenths + 512, 0, 1023);
-    roll_enc  = clamp_u32(roll_tenths + 512, 0, 1023);
-    height_enc = clamp_u32(height_mm, 0, 1023);
-
-    word1 |= (pitch_enc & 0x3FFU) << 0;
-    word1 |= (roll_enc & 0x3FFU) << 10;
-    word1 |= (height_enc & 0x3FFU) << 20;
-    word1 |= ((uint32_t)g_operational_state & 0x03U) << 30;
-
-    write_le32(&out_bytes[0], word0);
-    write_le32(&out_bytes[4], word1);
-}
-
-void Subsystem4_Unpack_Telemetry(const uint8_t in_bytes[SUBSYSTEM4_TLM_PAYLOAD_BYTES],
-                                 subsystem4_tlm_decoded_t *p_decoded)
-{
-    uint32_t word0;
-    uint32_t word1;
-    int32_t pitch_enc;
-    int32_t roll_enc;
-    uint32_t height_enc;
-
-    if ((in_bytes == (const uint8_t *)0) ||
-        (p_decoded == (subsystem4_tlm_decoded_t *)0)) {
-        return;
-    }
-
-    word0 = read_le32(&in_bytes[0]);
-    word1 = read_le32(&in_bytes[4]);
-
-    p_decoded->msg_type = (uint8_t)((word0 >> 0) & 0x07U);
-    p_decoded->timestamp_ms = (word0 >> 3) & 0xFFFFFU;
-    p_decoded->motion_state = (motion_class_t)((word0 >> 23) & 0x07U);
-    p_decoded->hump_active = (((word0 >> 26) & 0x01U) != 0U);
-    p_decoded->sudden_impact = (((word0 >> 27) & 0x01U) != 0U);
-    p_decoded->fault_summary = (uint8_t)((word0 >> 28) & 0x0FU);
-
-    pitch_enc = (int32_t)((word1 >> 0) & 0x3FFU);
-    roll_enc = (int32_t)((word1 >> 10) & 0x3FFU);
-    height_enc = (word1 >> 20) & 0x3FFU;
-
-    p_decoded->pitch_deg = (float)(pitch_enc - 512) / 10.0f;
-    p_decoded->roll_deg = (float)(roll_enc - 512) / 10.0f;
-    p_decoded->peak_height_cm = (float)height_enc / 10.0f;
-    p_decoded->op_state = (uint8_t)((word1 >> 30) & 0x03U);
-}
-
-void Subsystem4_Pack_Fault(uint32_t fault_mask,
-                           uint32_t timestamp_ms,
-                           int16_t peak_accel_mg,
-                           uint8_t out_bytes[SUBSYSTEM4_TLM_PAYLOAD_BYTES])
-{
-    uint32_t word0 = 0U;
-    uint32_t word1 = 0U;
-
-    if (out_bytes == (uint8_t *)0) {
-        return;
-    }
-
-    word0 |= ((uint32_t)SUBSYSTEM4_MSG_TYPE_FAULT_EVENT & 0x07U) << 0;
-    word0 |= (timestamp_ms & 0xFFFFFU) << 3;
-    word0 |= (fault_mask & 0x1FFU) << 23;
-
-    word1 |= ((uint32_t)((uint16_t)peak_accel_mg) & 0xFFFFU) << 0;
-    word1 |= (fault_mask & 0xFFFFU) << 16;
-
-    write_le32(&out_bytes[0], word0);
-    write_le32(&out_bytes[4], word1);
-}
-
-void Subsystem4_Unpack_Fault(const uint8_t in_bytes[SUBSYSTEM4_TLM_PAYLOAD_BYTES],
-                             uint32_t *p_fault_mask,
-                             uint32_t *p_timestamp_ms,
-                             int16_t *p_peak_accel_mg)
-{
-    uint32_t word0;
-    uint32_t word1;
-
-    if (in_bytes == (const uint8_t *)0) {
-        return;
-    }
-
-    word0 = read_le32(&in_bytes[0]);
-    word1 = read_le32(&in_bytes[4]);
-
-    if (p_timestamp_ms != (uint32_t *)0) {
-        *p_timestamp_ms = (word0 >> 3) & 0xFFFFFU;
-    }
-    if (p_peak_accel_mg != (int16_t *)0) {
-        *p_peak_accel_mg = (int16_t)(word1 & 0xFFFFU);
-    }
-    if (p_fault_mask != (uint32_t *)0) {
-        *p_fault_mask = (word1 >> 16) & 0xFFFFU;
-    }
-}
-
-/* ==========================================================================
- * Dual Fixed-Size Pool & Non-Blocking Telemetry Mailbox (Tribunal 1 Buddy 1/4)
- * ========================================================================== */
-
-ER Subsystem4_Telemetry_Init(void)
-{
-    T_CMPF mpf_cfg;
-    T_CMBX mbx_cfg;
-
-    if (g_telemetry_initialized) {
-        return E_OK;
-    }
-
-    /* tlm_data_mpf: 24 x 16 B = 384 B routine latest-state pool */
-    mpf_cfg.exinf = NULL;
-    mpf_cfg.mpfatr = TA_TFIFO;
-    mpf_cfg.mpfcnt = (INT)SUBSYSTEM4_TLM_DATA_POOL_BLOCKS;
-    mpf_cfg.blfsz = (INT)sizeof(subsystem4_tlm_block_t);
-    g_tlm_data_mpf_id = tk_cre_mpf(&mpf_cfg);
-    if (g_tlm_data_mpf_id < E_OK) {
-        return (ER)g_tlm_data_mpf_id;
-    }
-
-    /* tlm_fault_mpf: 6 x 16 B = 96 B dedicated fault pool */
-    mpf_cfg.mpfcnt = (INT)SUBSYSTEM4_TLM_FAULT_POOL_BLOCKS;
-    g_tlm_fault_mpf_id = tk_cre_mpf(&mpf_cfg);
-    if (g_tlm_fault_mpf_id < E_OK) {
-        return (ER)g_tlm_fault_mpf_id;
-    }
-
-    /* terrain_tlm_mbx: non-blocking mailbox for Buddy 1 telemetry_dispatch_task */
-    mbx_cfg.exinf = NULL;
-    mbx_cfg.mbxatr = TA_TFIFO | TA_MFIFO;
-    g_terrain_tlm_mbx_id = tk_cre_mbx(&mbx_cfg);
-    if (g_terrain_tlm_mbx_id < E_OK) {
-        return (ER)g_terrain_tlm_mbx_id;
-    }
-
-    g_telemetry_initialized = true;
-    return E_OK;
-}
-
-bool Subsystem4_Telemetry_Send_State(const terrain_state_t *p_terrain,
-                                     uint32_t timestamp_ms)
-{
-    subsystem4_tlm_block_t *p_blk = NULL;
-    ER rc;
-
-    if ((p_terrain == (const terrain_state_t *)0) || !g_telemetry_initialized) {
-        return false;
-    }
-
-    /* Strict TMO_POL non-blocking allocation */
-    rc = tk_get_mpf(g_tlm_data_mpf_id, ( void ** )&p_blk, TMO_POL);
-    if ((rc < E_OK) || (p_blk == NULL)) {
-        /*
-         * Latest-state overwrite policy (Tribunal 1 Buddy 1):
-         * If routine pool is exhausted while WiFi is offline, pop the oldest
-         * queued routine block and reuse it so the newest state is retained.
-         */
-        T_MSG *p_old_msg = NULL;
-        if (tk_rcv_mbx(g_terrain_tlm_mbx_id, &p_old_msg, TMO_POL) == E_OK &&
-            (p_old_msg != NULL)) {
-            subsystem4_tlm_block_t *p_old_blk = (subsystem4_tlm_block_t *)p_old_msg;
-            if (p_old_blk->is_fault_block != 0U) {
-                /* Never overwrite a fault record: requeue fault and drop routine */
-                (void)tk_snd_mbx(g_terrain_tlm_mbx_id, (T_MSG *)p_old_blk);
-                ++g_tlm_stats.data_packets_overwritten;
-                return false;
-            }
-            p_blk = p_old_blk;
-            ++g_tlm_stats.data_packets_overwritten;
-        } else {
-            ++g_tlm_stats.data_packets_overwritten;
-            return false;
-        }
-    }
-
-    p_blk->is_fault_block = 0U;
-    p_blk->payload_len = SUBSYSTEM4_TLM_PAYLOAD_BYTES;
-    p_blk->seq_num = ++g_tlm_seq_num;
-    Subsystem4_Pack_Telemetry(p_terrain, timestamp_ms, p_blk->payload);
-
-    rc = tk_snd_mbx(g_terrain_tlm_mbx_id, (T_MSG *)p_blk);
-    if (rc < E_OK) {
-        (void)tk_rel_mpf(g_tlm_data_mpf_id, p_blk);
-        return false;
-    }
-
-    ++g_tlm_stats.data_packets_sent;
-    return true;
-}
-
-bool Subsystem4_Telemetry_Send_Fault(uint32_t fault_mask,
-                                     uint32_t timestamp_ms,
-                                     int16_t peak_accel_mg)
-{
-    subsystem4_tlm_block_t *p_blk = NULL;
-    ER rc;
-
-    if (!g_telemetry_initialized) {
-        return false;
-    }
-
-    rc = tk_get_mpf(g_tlm_fault_mpf_id, (void **)&p_blk, TMO_POL);
-    if ((rc < E_OK) || (p_blk == NULL)) {
-        /*
-         * Non-blocking fault overflow policy (Tribunal 1 Version C):
-         * Increment drop counter; active fault bits remain latched in
-         * g_shared_fault_bitmask for immediate re-transmission upon reconnect.
-         */
-        ++g_tlm_stats.fault_packets_dropped;
-        return false;
-    }
-
-    p_blk->is_fault_block = 1U;
-    p_blk->payload_len = SUBSYSTEM4_TLM_PAYLOAD_BYTES;
-    p_blk->seq_num = ++g_tlm_seq_num;
-    Subsystem4_Pack_Fault(fault_mask, timestamp_ms, peak_accel_mg, p_blk->payload);
-
-    rc = tk_snd_mbx(g_terrain_tlm_mbx_id, (T_MSG *)p_blk);
-    if (rc < E_OK) {
-        (void)tk_rel_mpf(g_tlm_fault_mpf_id, p_blk);
-        ++g_tlm_stats.fault_packets_dropped;
-        return false;
-    }
-
-    ++g_tlm_stats.fault_packets_sent;
-    return true;
-}
-
-bool Subsystem4_Telemetry_Pop_Packet(uint8_t out_bytes[SUBSYSTEM4_TLM_PAYLOAD_BYTES],
-                                     bool *p_is_fault)
-{
-    T_MSG *p_msg = NULL;
-    subsystem4_tlm_block_t *p_blk;
-    uint32_t i;
-
-    if (!g_telemetry_initialized || (out_bytes == (uint8_t *)0)) {
-        return false;
-    }
-
-    if (tk_rcv_mbx(g_terrain_tlm_mbx_id, &p_msg, TMO_POL) < E_OK ||
-        (p_msg == NULL)) {
-        return false;
-    }
-
-    p_blk = (subsystem4_tlm_block_t *)p_msg;
-    for (i = 0U; i < SUBSYSTEM4_TLM_PAYLOAD_BYTES; ++i) {
-        out_bytes[i] = p_blk->payload[i];
-    }
-    if (p_is_fault != (bool *)0) {
-        *p_is_fault = (p_blk->is_fault_block != 0U);
-    }
-
-    if (p_blk->is_fault_block != 0U) {
-        (void)tk_rel_mpf(g_tlm_fault_mpf_id, p_blk);
-    } else {
-        (void)tk_rel_mpf(g_tlm_data_mpf_id, p_blk);
-    }
-    return true;
-}
-
-void Subsystem4_Telemetry_Get_Stats(subsystem4_telemetry_stats_t *p_stats)
-{
-    if (p_stats != (subsystem4_telemetry_stats_t *)0) {
-        *p_stats = g_tlm_stats;
-        p_stats->active_fault_mask = Subsystem4_Fault_Get_Mask();
-    }
-}
+#if APP_TEST
+EXPORT void subsystem4_test(void) { }
+#endif

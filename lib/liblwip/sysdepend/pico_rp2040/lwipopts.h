@@ -39,7 +39,7 @@
 
 #define MEM_LIBC_MALLOC             0
 #define MEM_ALIGNMENT               4
-#define MEM_SIZE                    (16 * 1024)
+#define MEM_SIZE                    (17 * 1024)	/* 12 Nov: +1 KB for the larger MQTT buffer below (the client is allocated from this heap) */
 
 #define MEMP_NUM_TCP_SEG            32
 #define MEMP_NUM_ARP_QUEUE          10
@@ -62,6 +62,11 @@
 
 #define TCP_MSS                     1460
 #define TCP_WND                     (8 * TCP_MSS)
+/* 12 Nov: lwIP MQTT keeps unsent publishes in this buffer (default 256
+   bytes, ~7 frames).  On the phone hotspot a short WiFi stall filled it
+   and later frames were refused (lost status/telemetry, gaps in the GUI).
+   1 KB holds ~1.5 s of telemetry. */
+#define MQTT_OUTPUT_RINGBUF_SIZE    1024
 #define TCP_SND_BUF                 (8 * TCP_MSS)
 #define TCP_SND_QUEUELEN            ((4 * (TCP_SND_BUF) + (TCP_MSS - 1)) / (TCP_MSS))
 

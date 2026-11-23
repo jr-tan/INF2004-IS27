@@ -104,6 +104,17 @@ EXPORT void startup_clock(ATR clkatr)
 
 	out_w(CLK_REF+CLK_x_DIV, div);
 
+	/* 12 Nov 2026 (IS27): start the 1 us tick.  The TIMER block (time_us,
+	   now_us()/now_ms() in the app, the Pico SDK and CYW43 delays, lwIP
+	   timeouts) counts ticks from the watchdog tick generator, which divides
+	   clk_ref by TICK.CYCLES.  Nothing set it, so the timer ran at
+	   12 MHz / 512 = 23.4 kHz: every timer-based time was 42.7x too slow
+	   (measured over MQTT: now_ms() advanced 23.4 per second).
+	   RP2040 datasheet 4.7 Watchdog, TICK register (WATCHDOG_BASE
+	   0x40058000 + 0x2c): CYCLES [8:0] = clk_ref in MHz, ENABLE bit 9.
+	   Same as the SDK's tick_start(TICK_WATCHDOG, 12). */
+	out_w(0x40058000U + 0x2cU, 0x200U | (UW)XOSC_MHz);
+
 	/* CLK SYS settings */
 	div = (TMCLK_MHz << 8) / TMCLK_MHz;
 	if (div > in_w(CLK_SYS+CLK_x_DIV)) out_w(CLK_SYS+CLK_x_DIV, div);

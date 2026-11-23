@@ -1,124 +1,110 @@
 /*
- *	comms_frames.h
- *	Subsystem 1 -- application data fields and binary MQTT frame codecs.
+ *	comms_frames.h  (Buddy 1)
+ *	Binary MQTT payloads (Change Requirement 1: minimum bits, packed,
+ *	no JSON).  Each frame is ONE little-endian bit string; the first
+ *	field takes the LOWEST bits:
+ *	    v = int.from_bytes(frame, "little");  field = (v >> offset) & mask
+ *	Built with explicit shifts and masks (comms_frames.c), never C
+ *	bit-fields, so the PC dashboard can rely on the layout.
+ *	Signed fields are two's complement in their width.  Values that
+ *	don't fit are saturated, never wrapped.
  *
- *	CHANGE REQUIREMENT 11 (minimum-bit data representation): every field uses
- *	only as many bits as its valid range needs.  The widths are named
- *	constants here so the "data representation table" in docs/ and the code
- *	cannot drift apart.  Frames are built with bitpack.h, never with C
- *	bit-fields (BARR-C 5.5), so the layout is compiler independent.
+ *	Topic              Fields (bits)                                   Bytes
+ *	robot/status       seq 4, uptime s 20, -rssi 7, mode 4, faults 12,
+ *	                   tx_drop 1                                         6
+ *	robot/event/fault  t ms 16, raised faults 12, pad 4                  4
+ *	robot/cmd (in)     code 3, id 5                                      1
+ *	robot/tlm/motion   t 16, vl s11 (mm/s), vr s11, dist 14 (cm),
+ *	                   owner 2, enc L ok 1, enc R ok 1                   7
+ *	robot/tlm/line     t 16, mode 3, pos s8 (/8), see 2, barcode char 6,
+ *	                   barcode action 3, set speed 8 (cm/s), bend % 7,
+ *	                   steering KP/100 5, bend stop + pivot on 1         8
+ *	robot/tlm/terrain  t 16, pitch s10 (0.1 deg), roll s10, hump 8 (mm),
+ *	                   heading 9 (deg, 511 = none), events 3             7
+ *	robot/tlm/obstacle t 16, dist 8, bearing s8, width 8, need L 8,
+ *	                   need R 8, action 2 (0 none 1 L 2 R 3 blocked),
+ *	                   stage 3 (OBS_* in car.h)                          8
+ *	robot/tlm/resources t 16, cpu0 % 7, cpu1 % 7, tasks 6, tasks max 6,
+ *	                   flags 5, flags max 5, sems 5, sems max 5, mbfs 4,
+ *	                   mbfs max 4, cycs 4, cycs max 4, out-queue fill % 7,
+ *	                   tx drops 8, motion loop us 12, line loop us 12     15
+ *	robot/cmd codes: 1 START 2 STOP 3 PAUSE 4 RESUME 5 PING 6 U-TURN 7 REVERSE
+ *	robot/map (in,     26 x action 3 (letter A first), pad 2            10
+ *	  GUI, retained)   action: 0 straight 1 left 2 right 3 U-turn 4 stop
+ *	robot/tlm/map      the map the car is using (same 10 bytes),
+ *	                   then flags 8 (bit 0 = a map arrived since boot)   11
  *
- *	Pure C, no kernel dependency -- unit-tested on the PC.
+ *	The status / fault / cmd layouts are the team's (docs/buddy1_comms.md),
+ *	so the existing dashboard still decodes them.
+ *
+ *	Pure C (stdint only): testing/comms_test/ checks it against the
+ *	Python decoder.
  */
-
 #ifndef COMMS_FRAMES_H
 #define COMMS_FRAMES_H
 
 #include <stdint.h>
-#include <stdbool.h>
-#include "comms_port.h"
 
-/* ------------------------------------------------------------------ */
-/*  System mode: 9 values (0..8)  ->  4 bits                           */
-/* ------------------------------------------------------------------ */
-#define SYS_MODE_BITS		(4U)
-#define SYS_MODE_INIT		(0U)
-#define SYS_MODE_IDLE		(1U)
-#define SYS_MODE_LINE		(2U)
-#define SYS_MODE_BARCODE	(3U)
-#define SYS_MODE_AVOID		(4U)
-#define SYS_MODE_RECOVERY	(5U)
-#define SYS_MODE_PAUSED		(6U)
-#define SYS_MODE_SAFE_STOP	(7U)
-#define SYS_MODE_COMPLETE	(8U)
-#define SYS_MODE_MAX		(8U)
+#define FR_STATUS_BYTES		6
+#define FR_FAULT_BYTES		4
+#define FR_MOTION_BYTES		7
+#define FR_LINE_BYTES		8
+#define FR_TERRAIN_BYTES	7
+#define FR_OBSTACLE_BYTES	8
+#define FR_RESOURCES_BYTES	15
+#define FR_MAP_BYTES		10
+#define FR_MAP_ACK_BYTES	11
+#define FR_MAP_LETTERS		26
+#define FR_MAP_ACT_MAX		4	/* = BC_ACT_END */
 
-/* ------------------------------------------------------------------ */
-/*  Fault bitmask: one bit per fault condition, shared by every buddy  */
-/*  (replaces separate integer variables and the old "last_fault").    */
-/* ------------------------------------------------------------------ */
-#define FAULT_BITS		(12U)
-#define FAULT_MOTOR_STALL	(1U << 0)
-#define FAULT_ENCODER		(1U << 1)
-#define FAULT_IMU		(1U << 2)
-#define FAULT_NO_ECHO		(1U << 3)
-#define FAULT_WIFI_LOSS		(1U << 4)
-#define FAULT_MQTT_LOSS		(1U << 5)	/* CONN_LOST: 3 missed heartbeats */
-#define FAULT_LINE		(1U << 6)	/* LINE_FAULT   (Buddy 3) */
-#define FAULT_AVOID		(1U << 7)	/* AVOID_FAULT  (Buddy 5) */
-#define FAULT_MOTION		(1U << 8)	/* MOTION_FAULT (Buddy 2) */
-#define FAULT_SUDDEN_IMPACT	(1U << 9)	/* Buddy 4 */
-#define FAULT_COMMS		(1U << 10)	/* repeated reconnect failure */
-/* bit 11 is reserved */
-#define FAULT_MASK_ALL		((1U << FAULT_BITS) - 1U)
+/* system mode on the wire (team's SYS_MODES list) */
+#define SYS_INIT		0
+#define SYS_IDLE		1
+#define SYS_LINE		2
+#define SYS_BARCODE		3
+#define SYS_AVOID		4
+#define SYS_RECOVERY		5
+#define SYS_PAUSED		6
+#define SYS_SAFE_STOP		7
+#define SYS_COMPLETE		8
 
-/* ------------------------------------------------------------------ */
-/*  Commands (robot/cmd): code 3 bits + id 5 bits = 8 bits = 1 byte     */
-/* ------------------------------------------------------------------ */
-#define CMD_CODE_BITS		(3U)
-#define CMD_ID_BITS		(5U)
-#define CMD_NONE		(0U)	/* invalid / never sent */
-#define CMD_START		(1U)
-#define CMD_STOP		(2U)
-#define CMD_PAUSE		(3U)
-#define CMD_RESUME		(4U)
-#define CMD_PING		(5U)	/* robot answers with a status frame at once */
-#define CMD_CODE_MAX		(5U)
-#define CMD_FRAME_BYTES		(1U)
+/* low-level: put 'width' bits of v at bit 'pos' (LE); buf must be zeroed */
+void bits_put(uint8_t *buf, uint32_t pos, uint32_t width, uint32_t v);
+uint32_t bits_get(const uint8_t *buf, uint32_t pos, uint32_t width);
 
+uint32_t fr_status(uint8_t *b, uint32_t seq, uint32_t up_s, uint32_t rssi_neg,
+		   uint32_t mode, uint32_t faults, uint32_t tx_drop);
+uint32_t fr_fault(uint8_t *b, uint32_t t_ms, uint32_t raised);
+uint32_t fr_motion(uint8_t *b, uint32_t t_ms, int32_t vl, int32_t vr,
+		   int32_t dist_cm, uint32_t owner, uint32_t enc_ok);
+/* enc_ok: bit 0 = left encoder healthy, bit 1 = right (12 Nov: was one
+   bit for both, so a fault didn't say which wheel) */
+uint32_t fr_line(uint8_t *b, uint32_t t_ms, uint32_t mode, int32_t pos,
+		 uint32_t see, char bc_char, uint32_t bc_action, int32_t speed_mms,
+		 int32_t bend_pct, int32_t kp_x1000, uint32_t pivot);
+/* robot/cmd tuning form (2..5 bytes, byte 0 = 0):
+   0, speed cm/s, bend %, KP/100, pivot (1 off, 2 on).  Returns 1 if this
+   is one.  Missing or 0 fields come back as 0 (= unchanged). */
+uint32_t fr_cmd_tune(const uint8_t *b, uint32_t len, int32_t *mms, int32_t *bend, int32_t *kp,
+		     int32_t *pivot);
+uint32_t fr_terrain(uint8_t *b, uint32_t t_ms, int32_t pitch_d10, int32_t roll_d10,
+		    int32_t hump_mm, int32_t heading, uint32_t events);
+uint32_t fr_obstacle(uint8_t *b, uint32_t t_ms, int32_t dist, int32_t bearing,
+		     int32_t width, int32_t need_l, int32_t need_r, uint32_t action,
+		     uint32_t stage);
 typedef struct {
-	uint8_t code;		/* CMD_* */
-	uint8_t id;		/* 0..31, increments per command sent */
-} cmd_frame_t;
+	uint32_t cpu0, cpu1, tasks, tasks_max, flags, flags_max, sems, sems_max,
+		 mbfs, mbfs_max, cycs, cycs_max, queue_pct, drops, motion_us, line_us;
+} FR_RES;
+uint32_t fr_resources(uint8_t *b, uint32_t t_ms, const FR_RES *r);
 
-/* ------------------------------------------------------------------ */
-/*  robot/status: 48 bits = 6 bytes                                     */
-/*    seq 4 | up_s 20 | rssi 7 | mode 4 | faults 12 | tx_drop 1         */
-/* ------------------------------------------------------------------ */
-#define ST_SEQ_BITS		(4U)
-#define ST_UP_BITS		(20U)	/* uptime in seconds, wraps after 12.1 days */
-#define ST_RSSI_BITS		(7U)	/* -RSSI in dBm, 1..127; 0 = unknown */
-#define ST_FAULT_BITS		FAULT_BITS
-#define ST_DROP_BITS		(1U)
-#define ST_TOTAL_BITS		(ST_SEQ_BITS + ST_UP_BITS + ST_RSSI_BITS + \
-				 SYS_MODE_BITS + ST_FAULT_BITS + ST_DROP_BITS)
-#define ST_FRAME_BYTES		((ST_TOTAL_BITS + 7U) / 8U)
+/* robot/cmd: returns code (1..7) or 0 if invalid; *id = 0..31 */
+uint32_t fr_cmd_decode(const uint8_t *b, uint32_t len, uint32_t *id);
 
-typedef struct {
-	uint8_t  seq;		/* 0..15, wraps */
-	uint32_t up_s;
-	uint8_t  rssi_neg_dbm;
-	uint8_t  mode;
-	uint16_t faults;
-	bool     tx_drop;	/* telemetry was dropped since the last status */
-} status_frame_t;
+/* robot/map: fills act[26] and returns 1 if b is exactly FR_MAP_BYTES
+   with every action 0..FR_MAP_ACT_MAX; else 0 and act is untouched. */
+uint32_t fr_map_decode(const uint8_t *b, uint32_t len, uint8_t *act);
+/* robot/tlm/map: the map in use + flags (bit 0 = received) */
+uint32_t fr_map_ack(uint8_t *b, const uint8_t *act, uint32_t received);
 
-/* ------------------------------------------------------------------ */
-/*  robot/event/fault: 28 bits -> 4 bytes (4 pad bits)                  */
-/*    t 16 (ms since boot, low 16 bits) | raised 12 | pad 4            */
-/* ------------------------------------------------------------------ */
-#define FE_T_BITS		(16U)
-#define FE_PAD_BITS		(4U)
-#define FE_TOTAL_BITS		(FE_T_BITS + FAULT_BITS + FE_PAD_BITS)
-#define FE_FRAME_BYTES		((FE_TOTAL_BITS + 7U) / 8U)
-
-typedef struct {
-	uint16_t t_ms;		/* low 16 bits of the uptime in ms */
-	uint16_t raised;	/* fault bits that were newly raised */
-} fault_frame_t;
-
-_Static_assert(ST_FRAME_BYTES <= COMMS_FRAME_MAX, "status frame too large");
-_Static_assert(FE_FRAME_BYTES <= COMMS_FRAME_MAX, "fault frame too large");
-_Static_assert(CMD_FRAME_BYTES <= COMMS_RX_MAX, "cmd frame too large");
-_Static_assert(CMD_CODE_BITS + CMD_ID_BITS == 8U, "cmd must be one byte");
-
-/* Encoders return the frame length in bytes, or 0 on error.  Decoders return
- * true only if the frame is the right length and every field is in range. */
-uint16_t comms_enc_status(uint8_t *buf, uint16_t cap, const status_frame_t *f);
-bool     comms_dec_status(const uint8_t *buf, uint16_t len, status_frame_t *f);
-uint16_t comms_enc_fault(uint8_t *buf, uint16_t cap, const fault_frame_t *f);
-bool     comms_dec_fault(const uint8_t *buf, uint16_t len, fault_frame_t *f);
-uint16_t comms_enc_cmd(uint8_t *buf, uint16_t cap, const cmd_frame_t *c);
-bool     comms_dec_cmd(const uint8_t *buf, uint16_t len, cmd_frame_t *c);
-
-#endif /* COMMS_FRAMES_H */
+#endif

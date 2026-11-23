@@ -15,7 +15,8 @@
  *	    COMMS_PUMP_MS it takes frames that application tasks queued with
  *	    comms_publish() and publishes them as BINARY payloads (Change
  *	    Requirement 11: no text values) on the robot/... topics;
- *	  - the client subscribes to robot/cmd and hands each complete payload to
+ *	  - the client subscribes to robot/cmd and robot/map (barcode map, marked
+ *	    with COMMS_RX_MAP_MARK) and hands each complete payload to
  *	    cmd_dispatch_task;
  *	  - reconnect uses 1 s, 2 s, 4 s ... capped at 10 s backoff (NFR-B1-3).
  *	All hand-over to the rest of the firmware goes through comms_port.h
@@ -26,6 +27,7 @@
  *	file's size_t workaround -- tm/tmonitor.h alone is namespace-safe here.
  */
 
+#include <string.h>
 #include "lwip/apps/mqtt.h"
 #include "lwip/ip_addr.h"
 #include "lwip/timeouts.h"
@@ -55,6 +57,7 @@
 #define MQTT_UTK_RX_DATA_MAX	COMMS_RX_MAX
 
 #define MQTT_CMD_TOPIC		MQTT_TOPIC_ROOT "/cmd"
+#define MQTT_MAP_TOPIC		MQTT_TOPIC_ROOT "/map"	/* barcode map from the GUI, retained */
 
 /* One row per comms_topic_t, in the same order. */
 static const struct {
@@ -65,9 +68,11 @@ static const struct {
 	{ MQTT_TOPIC_ROOT "/tlm/motion",   0, 0 },	/* COMMS_TOPIC_TLM_MOTION   */
 	{ MQTT_TOPIC_ROOT "/tlm/line",     0, 0 },	/* COMMS_TOPIC_TLM_LINE     */
 	{ MQTT_TOPIC_ROOT "/tlm/terrain",  0, 0 },	/* COMMS_TOPIC_TLM_TERRAIN  */
-	{ MQTT_TOPIC_ROOT "/tlm/obstacle", 0, 0 },	/* COMMS_TOPIC_TLM_OBSTACLE */
+	{ MQTT_TOPIC_ROOT "/tlm/obstacle", 1, 0 },	/* COMMS_TOPIC_TLM_OBSTACLE (QoS 1: one-off steps) */
 	{ MQTT_TOPIC_ROOT "/status",       0, 1 },	/* COMMS_TOPIC_STATUS (retained) */
 	{ MQTT_TOPIC_ROOT "/event/fault",  1, 0 },	/* COMMS_TOPIC_FAULT (QoS 1) */
+	{ MQTT_TOPIC_ROOT "/tlm/resources", 0, 0 },	/* COMMS_TOPIC_RESOURCES    */
+	{ MQTT_TOPIC_ROOT "/tlm/map",      1, 0 },	/* COMMS_TOPIC_MAP_ACK      */
 };
 
 static mqtt_client_t	*client;
@@ -80,7 +85,13 @@ static u32_t		retry_ms = MQTT_UTK_RETRY_MIN_MS;
  * one or more data callbacks; the payload is kept until the fragment carrying
  * MQTT_DATA_FLAG_LAST shows up. The payload is BINARY: it is never printed as
  * text and never altered. A payload longer than the buffer is discarded whole. */
-static u8_t		rx_is_cmd;
+/* rx_kind: what the message being received is.  A robot/map payload is
+ * handed over with COMMS_RX_MAP_MARK in front so the comms task can tell
+ * it from a command without a second buffer. */
+#define RX_NONE			0
+#define RX_CMD			1
+#define RX_MAP			2
+static u8_t		rx_kind;
 static u8_t		rx_data[MQTT_UTK_RX_DATA_MAX];
 static u16_t		rx_len;
 static u8_t		rx_overflow;
@@ -103,9 +114,13 @@ static void incoming_publish_cb(void *arg, const char *topic, u32_t tot_len)
 	(void)arg;
 	(void)tot_len;
 
-	rx_is_cmd = str_equal(topic, MQTT_CMD_TOPIC);
+	rx_kind = str_equal(topic, MQTT_CMD_TOPIC) ? RX_CMD
+		: str_equal(topic, MQTT_MAP_TOPIC) ? RX_MAP : RX_NONE;
 	rx_len = 0;
 	rx_overflow = 0;
+	if(rx_kind == RX_MAP) {
+		rx_data[rx_len++] = COMMS_RX_MAP_MARK;
+	}
 }
 
 static void incoming_data_cb(void *arg, const u8_t *data, u16_t len, u8_t flags)
@@ -114,7 +129,7 @@ static void incoming_data_cb(void *arg, const u8_t *data, u16_t len, u8_t flags)
 
 	(void)arg;
 
-	if(!rx_is_cmd) {
+	if(rx_kind == RX_NONE) {
 		return;
 	}
 
@@ -127,7 +142,9 @@ static void incoming_data_cb(void *arg, const u8_t *data, u16_t len, u8_t flags)
 	}
 
 	if((flags & MQTT_DATA_FLAG_LAST) != 0) {
-		if(!rx_overflow) {
+		if((rx_kind == RX_MAP) && (rx_len <= 1)) {
+			/* empty retained message = map cleared on the broker: keep the current map */
+		} else if(!rx_overflow) {
 			comms_port_rx_push(rx_data, rx_len);
 #if COMMS_DEBUG
 			tm_printf((UB*)"mqtt: RX cmd %d byte(s), first=0x%02x\n",
@@ -136,7 +153,7 @@ static void incoming_data_cb(void *arg, const u8_t *data, u16_t len, u8_t flags)
 		} else {
 			tm_printf((UB*)"mqtt: RX cmd too long, discarded\n");
 		}
-		rx_is_cmd = 0;
+		rx_kind = RX_NONE;
 	}
 }
 
@@ -144,7 +161,7 @@ static void subscribe_done_cb(void *arg, err_t result)
 {
 	(void)arg;
 	if(result == ERR_OK) {
-		tm_printf((UB*)"mqtt: subscribed to " MQTT_CMD_TOPIC "\n");
+		tm_printf((UB*)"mqtt: subscribed to %s\n", (arg != NULL) ? MQTT_MAP_TOPIC : MQTT_CMD_TOPIC);
 	} else {
 		tm_printf((UB*)"mqtt: subscribe failed, err=%d\n", (int)result);
 	}
@@ -154,6 +171,14 @@ static void subscribe_done_cb(void *arg, err_t result)
  * it publishes queued frames.  While NOT connected it discards them: stale
  * telemetry is worthless and must not pile up or fire in a burst after the
  * link returns (the next status frame carries the latest state). */
+/* 12 Nov: a QoS 1 frame (obstacle step, fault) that mqtt_publish() could
+ * not take (ERR_MEM: output buffer or in-flight slots full during a WiFi
+ * stall) is kept here and tried again on the next pump, instead of being
+ * lost.  One slot is enough: these frames are rare. */
+static u8_t	retry_frame[COMMS_FRAME_MAX];
+static u16_t	retry_len;
+static u8_t	retry_topic;
+
 static void pump_timeout(void *arg)
 {
 	u8_t	topic;
@@ -166,6 +191,18 @@ static void pump_timeout(void *arg)
 
 	connected = (client != NULL) && mqtt_client_is_connected(client);
 
+	if(retry_len != 0) {
+		if(!connected) {
+			retry_len = 0;		/* stale after a reconnect: drop it */
+			comms_port_publish_result(0);
+		} else if(mqtt_publish(client, topic_tab[retry_topic].name, retry_frame, retry_len,
+				       topic_tab[retry_topic].qos, topic_tab[retry_topic].retain,
+				       NULL, NULL) == ERR_OK) {
+			retry_len = 0;
+			comms_port_publish_result(1);
+		}
+	}
+
 	for(burst = 0; burst < COMMS_PUMP_BURST; burst++) {
 		len = comms_port_tx_pop(&topic, frame, (u16_t)sizeof(frame));
 		if(len == 0) {
@@ -174,11 +211,25 @@ static void pump_timeout(void *arg)
 		if(!connected || (topic >= COMMS_TOPIC_COUNT)) {
 			continue;	/* dropped (see above) */
 		}
+		if(topic_tab[topic].name == NULL) {
+			/* A topic id with no row in topic_tab (table not updated when
+			   comms_topic_t grew): drop it instead of passing NULL to
+			   mqtt_publish(), which asserts and hangs this task. */
+			tm_printf((UB*)"mqtt: no topic name for id %d, frame dropped\n", (int)topic);
+			comms_port_publish_result(0);
+			continue;
+		}
 		{
 			err_t err = mqtt_publish(client, topic_tab[topic].name, frame, len,
 						 topic_tab[topic].qos, topic_tab[topic].retain,
 						 NULL, NULL);
-			comms_port_publish_result((err == ERR_OK)? 1: 0);
+			if((err != ERR_OK) && (topic_tab[topic].qos != 0) && (retry_len == 0)) {
+				MEMCPY(retry_frame, frame, len);	/* try again next pump */
+				retry_len = len;
+				retry_topic = topic;
+			} else {
+				comms_port_publish_result((err == ERR_OK)? 1: 0);
+			}
 #if COMMS_DEBUG
 			if(err == ERR_OK) {
 				tm_printf((UB*)"mqtt: TX %s (%d bytes)\n",
@@ -228,6 +279,15 @@ static void connection_cb(mqtt_client_t *c, void *arg, mqtt_connection_status_t 
 				     subscribe_done_cb, NULL);
 		if(err != ERR_OK) {
 			tm_printf((UB*)"mqtt: mqtt_subscribe() failed, err=%d\n",
+				  (int)err);
+		}
+		/* The barcode map is retained, so the broker sends the GUI's
+		 * last map straight after this subscribe (also after a reconnect).
+		 * arg != NULL only tells subscribe_done_cb which topic it was. */
+		err = mqtt_subscribe(client, MQTT_MAP_TOPIC, 1 /* qos */,
+				     subscribe_done_cb, (void *)1);
+		if(err != ERR_OK) {
+			tm_printf((UB*)"mqtt: mqtt_subscribe(map) failed, err=%d\n",
 				  (int)err);
 		}
 
@@ -284,7 +344,16 @@ void mqtt_utk_start(void)
 	err = mqtt_client_connect(client, &broker_addr, MQTT_BROKER_PORT,
 				  connection_cb, NULL, &client_info);
 	if(err != ERR_OK) {
-		tm_printf((UB*)"mqtt: mqtt_client_connect() failed, err=%d\n", (int)err);
-		connecting = 0;
+		/* Failed synchronously (e.g. ERR_RTE = -10 while WiFi is down).  The poll
+		 * loop calls this function constantly, so without a backoff it would
+		 * retry -- and print -- on every pass.  Keep the "connecting" guard set
+		 * and retry from a timer, on the same 1, 2, 4, 8, 10 s backoff. */
+		tm_printf((UB*)"mqtt: mqtt_client_connect() failed, err=%d, retrying in %lu ms\n",
+			  (int)err, (unsigned long)retry_ms);
+		sys_timeout(retry_ms, retry_timeout, NULL);
+		retry_ms *= 2;
+		if(retry_ms > MQTT_UTK_RETRY_MAX_MS) {
+			retry_ms = MQTT_UTK_RETRY_MAX_MS;
+		}
 	}
 }

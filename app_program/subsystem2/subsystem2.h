@@ -1,42 +1,90 @@
 /*
- *	subsystem2.h
- *	Subsystem 2 -- Producer (sample source).  Student ID: <student ID>.
+ *	subsystem2.h  (Buddy 2: motion)
+ *	Motor PWM, wheel encoders and the 20 ms motion loop.
+ *	Public API is in car.h; this file holds the tunables.
  *
- *	Public interface of subsystem 2.  Other subsystems include it as
- *	"../subsystem2/subsystem2.h".
+ *	Hybrid control
+ *	  duty = (D0 + K * speed) * wheel gain      (open loop, always on)
+ *	       + encoder trim                       (only while BOTH encoders
+ *	                                             are healthy)
+ *	The car still drives straight on the open-loop part if an encoder
+ *	drops out (our left one does), it just stops learning.
  */
-
 #ifndef SUBSYSTEM2_H
 #define SUBSYSTEM2_H
 
-#include "../app.h"
+#include "../car.h"
 
-#define S2_PRI_PRODUCER		14	/* priority band 14-15 (TEAM.md) */
-#define S2_PERIOD_MS		300	/* one sample every 300 ms */
+/* ---- PWM ---- */
+#define MOT_PWM_HZ		10000		/* 125 MHz / 12500 */
 
-/* ---------------------------------------------------------------------
- *  IF-01 data format: one sample, sent to subsystem 3's mailbox.
- *  A mailbox message MUST start with a T_MSG header: the kernel links
- *  messages together through it, so the data itself is never copied.
- * --------------------------------------------------------------------- */
+/* ---- open loop: speed (mm/s) -> duty (per mille) ----
+   2 Nov circuit log: 25.5 % duty = 140 mm/s on the mat */
+#define MOT_D0_PM		120		/* duty where the wheels start to turn */
+#define MOT_K_PM_X1000		986		/* + duty per mm/s, x1000 */
+#define MOT_GAIN_L_X1000	1150		/* CAL: left motor is ~15 % weaker */
+#define MOT_GAIN_R_X1000	1000
+#define MOT_MAX_MMS		600
+
+/* ---- ramps ---- */
+#define MOT_ACCEL_MMS2		800		/* set-point ramp, both directions */
+#define MOT_KICK_PM		120		/* extra duty when a wheel starts */
+#define MOT_KICK_MS		250
+
+/* ---- encoders ----
+   x4 quadrature: ~2490 steps per wheel turn, 65 mm wheel
+   => pi * 65000 um / 2490 = 82 um per step */
+#define ENC_UM_PER_STEP		82
+/* CAL: wheel track = distance between the centres of the two wheels
+   (where they touch the floor).  Turning heading = (right - left) / track.
+   Check: turn the car one full circle on the spot by hand; the console
+   "head" value should change by about 3600. */
+#define MOT_TRACK_MM		108		/* measured 12 Nov (was 125: every encoder turn came out ~16 % too big) */
+#define ENC_WINDOW_TICKS	5		/* speed over 5 x 20 ms = 100 ms */
+#define ENC_DEAD_MS		200		/* driven, no steps this long = unhealthy */
+#define ENC_HEAL_MS		1000		/* steps again this long = healthy */
+#define ENC_MIN_MMS		40		/* below this the speed reading is too coarse */
+
+/* ---- encoder trim (the "hybrid" part): per-wheel speed control ---- */
+#define TRIM_KI_X1000		100		/* duty pm per (mm/s error) per tick, x1000 */
+#define TRIM_MAX_PM		300		/* never more than +-30 % duty (was 15 %:
+						   not enough to hold speed up a slope) */
+#define TRIM_MIN_MMS		15		/* learns from this speed up (was 40) */
+
+/* ---- stall boost (12 Nov evening): driven, no encoder steps for
+   STALL_MS -> add STALL_BOOST_STEP_PM per 20 ms tick, up to
+   STALL_BOOST_MAX_PM; fades by STALL_BOOST_FADE_PM per tick once the
+   wheel turns.  Still no steps STALL_GIVEUP_MS after reaching the
+   maximum = the ENCODER is dead, not the wheel stuck. ---- */
+#define STALL_MIN_MMS		15
+#define STALL_MS		150
+#define STALL_BOOST_STEP_PM	15		/* 0 -> max in ~0.5 s */
+#define STALL_BOOST_MAX_PM	350
+#define STALL_BOOST_FADE_PM	5		/* max -> 0 in ~1.4 s */
+#define STALL_GIVEUP_MS		600
+
+/* ---- motion_flg bits ---- */
+#define MF_TICK			(1U << 0)	/* from the 20 ms cyclic handler */
+#define MF_WAKE			(1U << 1)	/* owner change / STOP */
+
+/* drivers */
+#define MOTOR_L			0
+#define MOTOR_R			1
+IMPORT void drv_motor_init(void);
+IMPORT void drv_motor_set(UINT m, INT dir, UINT duty_pm);	/* dir +1 / -1 */
+IMPORT void drv_motor_brake(UINT m);				/* both low */
+
 typedef struct {
-	T_MSG	hdr;		/* used by the kernel, do not touch */
-	UW	seq;		/* sample sequence number */
-	UW	time_ms;	/* system time when the sample was taken */
-	INT	value;		/* the "measurement", 0..100 */
-	INT	prc;		/* processor (core) that produced it: 1 or 2 */
-} SAMPLE_MSG;
+	UW	count;		/* steps, only goes up */
+	W	pos;		/* signed steps, + = forward */
+	UW	last_us;	/* time of the last counted step */
+	UW	glitch;
+} ENC_SNAP;
+IMPORT ER   drv_encoder_init(void);		/* call on CORE 0 */
+IMPORT void drv_encoder_snapshot(ENC_SNAP s[2]);	/* call on CORE 0 */
 
-#define S2_POOL_COUNT	4	/* at most 4 samples in flight */
+/* shared with subsystem3 (line task is woken by the same tick) */
+IMPORT ID motion_flg;
+IMPORT ID line_task_id;
 
-/* IF-02: the receiver of a sample gives its memory block back to
-   mpf_samples (tk_rel_mpf) and then a slot back to sem_slots
-   (tk_sig_sem, count 1).  Nothing else may use these two objects. */
-IMPORT ID	sem_slots;
-IMPORT ID	mpf_samples;
-
-/* Private to subsystem 2 */
-IMPORT void	producer_task(INT stacd, void *exinf);
-IMPORT INT	s2_make_value(UW seq);
-
-#endif /* SUBSYSTEM2_H */
+#endif
